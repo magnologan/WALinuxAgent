@@ -10,13 +10,6 @@ pool:
   vmImage: ubuntu-latest
 
 steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
-
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
 
 - task: AzureCLI@2
   inputs:
@@ -24,7 +17,7 @@ steps:
     scriptType: 'bash'
     scriptLocation: 'inlineScript'
     inlineScript: |
-      az rest \
-          --method GET \
-          --url "https://management.azure.com/subscriptions/8e037ad4-618f-4466-8bc8-5099d41ac15b/resources" \
-          --url-parameters api-version=2020-06-01 \$expand=createdTime \$select=name,createdTime
+      date=`date --utc +%Y-%m-%d'T'%H:%M'Z' -d "1 day ago"`
+      az rest --method GET --url "https://management.azure.com/subscriptions/8e037ad4-618f-4466-8bc8-5099d41ac15b/resourcegroups" 
+      --url-parameters api-version=2021-04-01 \$expand=createdTime --output json --query value| jq --arg date "$date" '.[] 
+      | select (.createdTime > $date).name'  | xargs -ol | grep "^dcr-v2-test" | xargs -otl -r az group delete --no-wait -y -n
