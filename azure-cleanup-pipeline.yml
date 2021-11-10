@@ -26,5 +26,5 @@ steps:
     inlineScript: |
       az rest \
           --method GET \
-          --url "https://management.azure.com/subscriptions/{subscription-id}/resources" \
+          --url "https://management.azure.com/subscriptions/8e037ad4-618f-4466-8bc8-5099d41ac15b/resources" \
           --url-parameters api-version=2020-06-01 \$expand=createdTime \$select=name,createdTime
