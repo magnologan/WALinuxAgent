@@ -20,5 +20,5 @@ steps:
       set -euxo pipefail
       xargs --version
       date=`date --utc +%Y-%m-%d'T'%H:%M'Z' -d "1 day ago"`
-      az rest --method GET --url "https://management.azure.com/subscriptions/8e037ad4-618f-4466-8bc8-5099d41ac15b/resourcegroups" --url-parameters api-version=2021-04-01 \$expand=createdTime --output json --query value | jq --arg date "$date" '.[] | select (.createdTime < $date).name' | xargs -l
-      #   -r az group delete --no-wait -y -n grep "dcr-v2-test" |
+      az rest --method GET --url "https://management.azure.com/subscriptions/8e037ad4-618f-4466-8bc8-5099d41ac15b/resourcegroups" --url-parameters api-version=2021-04-01 \$expand=createdTime --output json --query value | jq --arg date "$date" '.[] | select (.createdTime < $date).name' | grep "dcr-v2-test" | xargs -lt -r az group delete --no-wait -y -n
+      #    |
