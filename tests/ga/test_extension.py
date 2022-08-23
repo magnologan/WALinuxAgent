@@ -15,6 +15,7 @@
 # Requires Python 2.6+ and Openssl 1.0+
 #
 import contextlib
+import datetime
 import glob
 import json
 import os.path
@@ -33,29 +34,29 @@ from azurelinuxagent.common.cgroupconfigurator import CGroupConfigurator
 from azurelinuxagent.common.datacontract import get_properties
 from azurelinuxagent.common.event import WALAEventOperation
 from azurelinuxagent.common.utils import fileutil
-from azurelinuxagent.common.utils.archive import StateArchiver
 from azurelinuxagent.common.utils.fileutil import read_file
 from azurelinuxagent.common.utils.flexible_version import FlexibleVersion
 from azurelinuxagent.common.version import PY_VERSION_MAJOR, PY_VERSION_MINOR, PY_VERSION_MICRO, AGENT_NAME, \
     AGENT_VERSION
 from azurelinuxagent.common.exception import ResourceGoneError, ExtensionDownloadError, ProtocolError, \
     ExtensionErrorCodes, ExtensionError, GoalStateAggregateStatusCodes
-from azurelinuxagent.common.protocol.restapi import Extension, ExtHandler, ExtHandlerStatus, \
-    ExtensionStatus, ExtHandlerRequestedState
+from azurelinuxagent.common.protocol.restapi import ExtensionSettings, Extension, ExtHandlerStatus, \
+    ExtensionStatus, ExtensionRequestedState
+from azurelinuxagent.common.protocol import wire
 from azurelinuxagent.common.protocol.wire import WireProtocol, InVMArtifactsProfile
 from azurelinuxagent.common.utils.restutil import KNOWN_WIRESERVER_IP
 
 from azurelinuxagent.ga.exthandlers import ExtHandlerInstance, migrate_handler_state, \
-    get_exthandlers_handler, AGENT_STATUS_FILE, ExtCommandEnvVariable, HandlerManifest, NOT_RUN, \
+    get_exthandlers_handler, ExtCommandEnvVariable, HandlerManifest, NOT_RUN, \
     ExtensionStatusValue, HANDLER_COMPLETE_NAME_PATTERN, HandlerEnvironment, GoalStateStatus
 
 from tests.protocol import mockwiredata
-from tests.protocol.mocks import mock_wire_protocol, HttpRequestPredicates, MockHttpResponse
+from tests.protocol.mocks import mock_wire_protocol, MockHttpResponse
+from tests.protocol.HttpRequestPredicates import HttpRequestPredicates
 from tests.protocol.mockwiredata import DATA_FILE, DATA_FILE_EXT_ADDITIONAL_LOCATIONS
 from tests.tools import AgentTestCase, data_dir, MagicMock, Mock, patch, mock_sleep
 from tests.ga.extension_emulator import Actions, ExtensionCommandNames, extension_emulator, \
     enable_invocations, generate_put_handler
-from tests.utils.test_archive import TestArchive
 
 # Mocking the original sleep to reduce test execution time
 SLEEP = time.sleep
@@ -157,7 +158,7 @@ class TestExtensionCleanup(AgentTestCase):
 
             # Update incarnation and extension config
             protocol.mock_wire_data.set_incarnation(2)
-            protocol.mock_wire_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+            protocol.mock_wire_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
 
             protocol.client.update_goal_state()
             exthandlers_handler.run()
@@ -169,14 +170,17 @@ class TestExtensionCleanup(AgentTestCase):
             self.assertEqual(0, TestExtensionCleanup._count_extension_directories(), "All extension directories should be removed")
 
     def test_cleanup_removes_orphaned_packages(self):
+        data_file = mockwiredata.DATA_FILE_NO_EXT.copy()
+        data_file["ext_conf"] = "wire/ext_conf_no_extensions-no_status_blob.xml"
+
         no_of_orphaned_packages = 5
-        with self._setup_test_env(mockwiredata.DATA_FILE_NO_EXT) as (exthandlers_handler, protocol, no_of_exts):
+        with self._setup_test_env(data_file) as (exthandlers_handler, protocol, no_of_exts):
             self.assertEqual(no_of_exts, 0, "Test setup error - Extensions found in ExtConfig")
 
             # Create random extension directories
             for i in range(no_of_orphaned_packages):
-                eh = ExtHandler(name='Random.Extension.ShouldNot.Be.There')
-                eh.properties.version = FlexibleVersion("9.9.0") + i
+                eh = Extension(name='Random.Extension.ShouldNot.Be.There')
+                eh.version = FlexibleVersion("9.9.0") + i
                 handler = ExtHandlerInstance(eh, "unused")
                 os.mkdir(handler.get_base_dir())
 
@@ -209,7 +213,7 @@ class TestExtensionCleanup(AgentTestCase):
 
             # Update incarnation and extension config to uninstall the extension, this should delete the extension
             protocol.mock_wire_data.set_incarnation(2)
-            protocol.mock_wire_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+            protocol.mock_wire_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
 
             protocol.client.update_goal_state()
             exthandlers_handler.run()
@@ -304,8 +308,8 @@ class TestHandlerStateMigration(AgentTestCase):
         handler_name = "Not.A.Real.Extension"
         handler_version = "1.2.3"
 
-        self.ext_handler = ExtHandler(handler_name)
-        self.ext_handler.properties.version = handler_version
+        self.ext_handler = Extension(handler_name)
+        self.ext_handler.version = handler_version
         self.ext_handler_i = ExtHandlerInstance(self.ext_handler, "dummy protocol")
 
         self.handler_state = "Enabled"
@@ -582,7 +586,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Test disable
         test_data.set_incarnation(5)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Disabled)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Disabled)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -592,7 +596,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Test uninstall
         test_data.set_incarnation(6)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -733,7 +737,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Test uninstall
         test_data.set_incarnation(2)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -784,7 +788,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Test uninstall
         test_data.set_incarnation(4)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -838,7 +842,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Uninstall the Plugin and make sure Disable called
         test_data.set_incarnation(2)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
         protocol.update_goal_state()
 
         with enable_invocations(test_ext) as invocation_record:
@@ -888,12 +892,12 @@ class TestExtension_Deprecated(TestExtensionBase):
 
             # check handler list and dependency levels
             self.assertTrue(exthandlers_handler.ext_handlers is not None)
-            self.assertTrue(exthandlers_handler.ext_handlers.extHandlers is not None)
-            self.assertEqual(len(exthandlers_handler.ext_handlers.extHandlers), 2)
-            self.assertEqual(1, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                     handler.name == dep_ext_level_1.name).properties.extensions[0].dependencyLevel)
-            self.assertEqual(2, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                     handler.name == dep_ext_level_2.name).properties.extensions[0].dependencyLevel)
+            self.assertTrue(exthandlers_handler.ext_handlers is not None)
+            self.assertEqual(len(exthandlers_handler.ext_handlers), 2)
+            self.assertEqual(1, next(handler for handler in exthandlers_handler.ext_handlers if
+                                     handler.name == dep_ext_level_1.name).settings[0].dependencyLevel)
+            self.assertEqual(2, next(handler for handler in exthandlers_handler.ext_handlers if
+                                     handler.name == dep_ext_level_2.name).settings[0].dependencyLevel)
 
             # Ensure the invocation order follows the dependency levels
             invocation_record.compare(
@@ -927,11 +931,11 @@ class TestExtension_Deprecated(TestExtensionBase):
             self._assert_handler_status(protocol.report_vm_status, "Ready", 1, "1.0.0")
             self._assert_ext_status(protocol.report_vm_status, "success", 1)
 
-            self.assertEqual(len(exthandlers_handler.ext_handlers.extHandlers), 2)
-            self.assertEqual(3, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                     handler.name == dep_ext_level_3.name).properties.extensions[0].dependencyLevel)
-            self.assertEqual(4, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                     handler.name == dep_ext_level_4.name).properties.extensions[0].dependencyLevel)
+            self.assertEqual(len(exthandlers_handler.ext_handlers), 2)
+            self.assertEqual(3, next(handler for handler in exthandlers_handler.ext_handlers if
+                                     handler.name == dep_ext_level_3.name).settings[0].dependencyLevel)
+            self.assertEqual(4, next(handler for handler in exthandlers_handler.ext_handlers if
+                                     handler.name == dep_ext_level_4.name).settings[0].dependencyLevel)
 
             # Ensure the invocation order follows the dependency levels
             invocation_record.compare(
@@ -944,7 +948,7 @@ class TestExtension_Deprecated(TestExtensionBase):
         # the first extension disabled. The first extension enabled should be
         # the last one disabled.
         test_data.set_incarnation(3)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Disabled)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Disabled)
         protocol.update_goal_state()
 
         with enable_invocations(dep_ext_level_3, dep_ext_level_4) as invocation_record:
@@ -954,10 +958,10 @@ class TestExtension_Deprecated(TestExtensionBase):
         self._assert_handler_status(protocol.report_vm_status, "NotReady", 1, "1.0.0",
                                     expected_handler_name="OSTCExtensions.OtherExampleHandlerLinux")
 
-        self.assertEqual(3, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                 handler.name == dep_ext_level_3.name).properties.extensions[0].dependencyLevel)
-        self.assertEqual(4, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                 handler.name == dep_ext_level_4.name).properties.extensions[0].dependencyLevel)
+        self.assertEqual(3, next(handler for handler in exthandlers_handler.ext_handlers if
+                                 handler.name == dep_ext_level_3.name).settings[0].dependencyLevel)
+        self.assertEqual(4, next(handler for handler in exthandlers_handler.ext_handlers if
+                                 handler.name == dep_ext_level_4.name).settings[0].dependencyLevel)
 
         # Ensure the invocation order follows the dependency levels
         invocation_record.compare(
@@ -970,7 +974,7 @@ class TestExtension_Deprecated(TestExtensionBase):
         # the first extension uninstalled. The first extension installed
         # should be the last one uninstalled.
         test_data.set_incarnation(4)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
 
         # Swap the dependency ordering AGAIN
         dep_ext_level_5 = extension_emulator(name="OSTCExtensions.OtherExampleHandlerLinux")
@@ -984,11 +988,11 @@ class TestExtension_Deprecated(TestExtensionBase):
             exthandlers_handler.report_ext_handlers_status()
 
             self._assert_no_handler_status(protocol.report_vm_status)
-            self.assertEqual(len(exthandlers_handler.ext_handlers.extHandlers), 2)
-            self.assertEqual(5, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                     handler.name == dep_ext_level_5.name).properties.extensions[0].dependencyLevel)
-            self.assertEqual(6, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                     handler.name == dep_ext_level_6.name).properties.extensions[0].dependencyLevel)
+            self.assertEqual(len(exthandlers_handler.ext_handlers), 2)
+            self.assertEqual(5, next(handler for handler in exthandlers_handler.ext_handlers if
+                                     handler.name == dep_ext_level_5.name).settings[0].dependencyLevel)
+            self.assertEqual(6, next(handler for handler in exthandlers_handler.ext_handlers if
+                                     handler.name == dep_ext_level_6.name).settings[0].dependencyLevel)
 
             # Ensure the invocation order follows the dependency levels
             invocation_record.compare(
@@ -1091,12 +1095,12 @@ class TestExtension_Deprecated(TestExtensionBase):
 
             # check handler list and dependency levels
             self.assertTrue(exthandlers_handler.ext_handlers is not None)
-            self.assertTrue(exthandlers_handler.ext_handlers.extHandlers is not None)
-            self.assertEqual(len(exthandlers_handler.ext_handlers.extHandlers), 2)
-            self.assertEqual(1, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                     handler.name == dep_ext_level_1.name).properties.extensions[0].dependencyLevel)
-            self.assertEqual(2, next(handler for handler in exthandlers_handler.ext_handlers.extHandlers if
-                                     handler.name == dep_ext_level_2.name).properties.extensions[0].dependencyLevel)
+            self.assertTrue(exthandlers_handler.ext_handlers is not None)
+            self.assertEqual(len(exthandlers_handler.ext_handlers), 2)
+            self.assertEqual(1, next(handler for handler in exthandlers_handler.ext_handlers if
+                                     handler.name == dep_ext_level_1.name).settings[0].dependencyLevel)
+            self.assertEqual(2, next(handler for handler in exthandlers_handler.ext_handlers if
+                                     handler.name == dep_ext_level_2.name).settings[0].dependencyLevel)
 
             # Ensure the invocation order follows the dependency levels
             invocation_record.compare(
@@ -1110,8 +1114,8 @@ class TestExtension_Deprecated(TestExtensionBase):
         exthandlers_handler.run()
         exthandlers_handler.report_ext_handlers_status()
 
-        self.assertEqual(exthandlers_handler.ext_handlers.extHandlers[0].properties.extensions[0].dependencyLevel, 0)
-        self.assertEqual(exthandlers_handler.ext_handlers.extHandlers[0].properties.extensions[0].dependencyLevel, 0)
+        self.assertEqual(exthandlers_handler.ext_handlers[0].settings[0].dependencyLevel, 0)
+        self.assertEqual(exthandlers_handler.ext_handlers[0].settings[0].dependencyLevel, 0)
 
     def test_ext_handler_sequencing_invalid_dependency_level(self, *args):
         test_data = mockwiredata.WireProtocolData(mockwiredata.DATA_FILE_EXT_SEQUENCING)
@@ -1126,8 +1130,8 @@ class TestExtension_Deprecated(TestExtensionBase):
         exthandlers_handler.run()
         exthandlers_handler.report_ext_handlers_status()
 
-        self.assertEqual(exthandlers_handler.ext_handlers.extHandlers[0].properties.extensions[0].dependencyLevel, 0)
-        self.assertEqual(exthandlers_handler.ext_handlers.extHandlers[0].properties.extensions[0].dependencyLevel, 0)
+        self.assertEqual(exthandlers_handler.ext_handlers[0].settings[0].dependencyLevel, 0)
+        self.assertEqual(exthandlers_handler.ext_handlers[0].settings[0].dependencyLevel, 0)
 
     def test_ext_handler_rollingupgrade(self, *args):
         # Test enable scenario.
@@ -1174,7 +1178,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Test disable
         test_data.set_incarnation(5)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Disabled)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Disabled)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -1184,7 +1188,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Test uninstall
         test_data.set_incarnation(6)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -1203,7 +1207,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Test re-install
         test_data.set_incarnation(8)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Enabled)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Enabled)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -1251,7 +1255,7 @@ class TestExtension_Deprecated(TestExtensionBase):
                     self._assert_handler_status(protocol.report_vm_status, "Ready", 1, "1.0.0")
                     self._assert_ext_status(protocol.report_vm_status, "success", 0)
 
-                    for ext_handler in exthandlers_handler.ext_handlers.extHandlers:
+                    for ext_handler in exthandlers_handler.ext_handlers:
                         ehi = ExtHandlerInstance(ext_handler, protocol)
                         self.assertEqual(enable_extensions, os.path.exists(ehi.get_extension_events_dir()),
                                          "Events directory incorrectly set")
@@ -1283,11 +1287,11 @@ class TestExtension_Deprecated(TestExtensionBase):
             self._assert_handler_status(protocol.report_vm_status, "Ready", 1, "1.0.0")
             self._assert_ext_status(protocol.report_vm_status, "success", 0)
 
-            ehi = ExtHandlerInstance(exthandlers_handler.ext_handlers.extHandlers[0], protocol)
+            ehi = ExtHandlerInstance(exthandlers_handler.ext_handlers[0], protocol)
             self.assertTrue(os.path.exists(ehi.get_extension_events_dir()), "Events directory should exist")
 
             # Uninstall extensions now
-            test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+            test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
             test_data.set_incarnation(2)
             protocol.update_goal_state()
 
@@ -1306,7 +1310,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Update version and set it to uninstall. That is how it would be propagated by CRP if a version 1.0.0 is
         # unregistered in PIR and a new version 1.0.1 is published.
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
         test_data.set_extensions_config_version("1.0.1")
         # Since the installed version is not in PIR anymore, we need to also remove it from manifest file
         test_data.manifest = test_data.manifest.replace("1.0.0", "9.9.9")
@@ -1451,7 +1455,7 @@ class TestExtension_Deprecated(TestExtensionBase):
             return original_popen(["echo", "Yes"], *args, **kwargs)
 
         with patch('azurelinuxagent.common.cgroupapi.subprocess.Popen', side_effect=mock_popen):
-            with patch('azurelinuxagent.ga.exthandlers._DEFAULT_EXT_TIMEOUT_MINUTES', 0.001):
+            with patch('azurelinuxagent.ga.exthandlers._DEFAULT_EXT_TIMEOUT_MINUTES', 0.01):
                 exthandlers_handler.run()
                 exthandlers_handler.report_ext_handlers_status()
 
@@ -1614,9 +1618,9 @@ class TestExtension_Deprecated(TestExtensionBase):
         exthandlers_handler, protocol = self._create_mock(test_data, *args)  # pylint: disable=unused-variable,no-value-for-parameter
 
         handler_name = "Handler"
-        exthandler = ExtHandler(name=handler_name)
-        extension = Extension(name=handler_name)
-        exthandler.properties.extensions.append(extension)
+        exthandler = Extension(name=handler_name)
+        extension = ExtensionSettings(name=handler_name)
+        exthandler.settings.append(extension)
 
         # In the following list of test cases, the first element corresponds to seq_no.
         # the second element is the status file name, the third element indicates if the status file exits or not.
@@ -1657,9 +1661,9 @@ class TestExtension_Deprecated(TestExtensionBase):
         exthandlers_handler, protocol = self._create_mock(test_data, *args)  # pylint: disable=unused-variable,no-value-for-parameter
 
         handler_name = "Handler"
-        exthandler = ExtHandler(name=handler_name)
-        extension = Extension(name=handler_name)
-        exthandler.properties.extensions.append(extension)
+        exthandler = Extension(name=handler_name)
+        extension = ExtensionSettings(name=handler_name)
+        exthandler.settings.append(extension)
 
         ext_handler_i = ExtHandlerInstance(exthandler, protocol)
 
@@ -1703,13 +1707,13 @@ class TestExtension_Deprecated(TestExtensionBase):
                         datafile = mockwiredata.DATA_FILE
 
                 _, protocol = self._create_mock(mockwiredata.WireProtocolData(datafile), *args)  # pylint: disable=no-value-for-parameter
-                ext_handlers, _ = protocol.get_ext_handlers()
-                self.assertEqual(1, len(ext_handlers.extHandlers))
-                ext_handler = ext_handlers.extHandlers[0]
+                ext_handlers = protocol.get_goal_state().extensions_goal_state.extensions
+                self.assertEqual(1, len(ext_handlers))
+                ext_handler = ext_handlers[0]
                 self.assertEqual('OSTCExtensions.ExampleHandlerLinux', ext_handler.name)
-                self.assertEqual(config_version, ext_handler.properties.version, "config version.")
+                self.assertEqual(config_version, ext_handler.version, "config version.")
                 ExtHandlerInstance(ext_handler, protocol).decide_version()
-                self.assertEqual(decision_version, ext_handler.properties.version, "decision version.")
+                self.assertEqual(decision_version, ext_handler.version, "decision version.")
 
     def test_ext_handler_version_decide_between_minor_versions(self, *args):
         """
@@ -1736,21 +1740,20 @@ class TestExtension_Deprecated(TestExtensionBase):
         ]
 
         _, protocol = self._create_mock(mockwiredata.WireProtocolData(mockwiredata.DATA_FILE), *args)  # pylint: disable=no-value-for-parameter
-        version_uri = Mock()
-        version_uri.uri = 'http://mock-goal-state/Microsoft.OSTCExtensions_ExampleHandlerLinux_asiaeast_manifest.xml'
+        version_uri = 'http://mock-goal-state/Microsoft.OSTCExtensions_ExampleHandlerLinux_asiaeast_manifest.xml'
 
         for (installed_version, config_version, expected_version) in cases:
             ext_handler = Mock()
             ext_handler.properties = Mock()
             ext_handler.name = 'OSTCExtensions.ExampleHandlerLinux'
-            ext_handler.versionUris = [version_uri]
-            ext_handler.properties.version = config_version
+            ext_handler.manifest_uris = [version_uri]
+            ext_handler.version = config_version
 
             ext_handler_instance = ExtHandlerInstance(ext_handler, protocol)
             ext_handler_instance.get_installed_version = Mock(return_value=installed_version)
 
             ext_handler_instance.decide_version()
-            self.assertEqual(expected_version, ext_handler.properties.version)
+            self.assertEqual(expected_version, ext_handler.version)
 
     @patch('azurelinuxagent.common.conf.get_extensions_enabled', return_value=False)
     def test_extensions_disabled(self, _, *args):
@@ -1872,7 +1875,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Next incarnation, disable extension
         test_data.set_incarnation(2)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Disabled)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Disabled)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -1903,7 +1906,7 @@ class TestExtension_Deprecated(TestExtensionBase):
 
         # Next incarnation, disable extension
         test_data.set_incarnation(2)
-        test_data.set_extensions_config_state(ExtHandlerRequestedState.Uninstall)
+        test_data.set_extensions_config_state(ExtensionRequestedState.Uninstall)
         protocol.update_goal_state()
 
         exthandlers_handler.run()
@@ -1933,7 +1936,7 @@ class TestExtension_Deprecated(TestExtensionBase):
         NotInstalled handlers), so we just re-use the existing zip of the new extension.
         """
         test_data, exthandlers_handler, protocol = self._set_up_update_test_and_update_gs(patch_get_update_command, *args)
-        extension_name = exthandlers_handler.ext_handlers.extHandlers[0].name
+        extension_name = exthandlers_handler.ext_handlers[0].name
         extension_calls = []
         original_popen = subprocess.Popen
 
@@ -2065,14 +2068,14 @@ class TestExtension_Deprecated(TestExtensionBase):
             old_version_args, old_version_kwargs = patch_report_event.call_args
             new_version_args, new_version_kwargs = patch_report_event.call_args_list[0]
 
-            self.assertEqual(new_version_args[0].ext_handler.properties.version, new_version,
+            self.assertEqual(new_version_args[0].ext_handler.version, new_version,
                              "The first call to report event should be from the new version of the ext-handler "
                              "to report download succeeded")
 
             self.assertEqual(new_version_kwargs['message'], "Download succeeded",
                              "The message should be Download Succedded")
 
-            self.assertEqual(old_version_args[0].ext_handler.properties.version, old_version,
+            self.assertEqual(old_version_args[0].ext_handler.version, old_version,
                              "The last report event call should be from the old version ext-handler "
                              "to report the event from the previous version")
 
@@ -2335,8 +2338,8 @@ class TestExtension_Deprecated(TestExtensionBase):
                 exthandlers_handler.report_ext_handlers_status()
 
                 for _, kwargs in mock_report_event.call_args_list:
-                    # The output is of the format - 'testfile.sh\n[stdout]ConfigSequenceNumber=N\n[stderr]'
-                    if test_file_name not in kwargs['message']:
+                    # The output is of the format - 'Command: testfile.sh -{Operation} \n[stdout]ConfigSequenceNumber=N\n[stderr]'
+                    if ("Command: " + test_file_name) not in kwargs['message']:
                         continue
                     self.assertIn("{0}={1}".format(ExtCommandEnvVariable.ExtensionSeqNumber, expected_seq_no),
                                   kwargs['message'])
@@ -2404,13 +2407,13 @@ class TestExtension_Deprecated(TestExtensionBase):
             with patch.object(ExtHandlerInstance, 'report_event') as mock_report_event:
                 exthandlers_handler.run()
                 exthandlers_handler.report_ext_handlers_status()
-                exthandlers_handler.report_ext_handlers_status()
 
-                _, disable_kwargs = mock_report_event.call_args_list[1]  # pylint: disable=unused-variable
-                _, update_kwargs = mock_report_event.call_args_list[2]
-                _, uninstall_kwargs = mock_report_event.call_args_list[3]  # pylint: disable=unused-variable
-                _, install_kwargs = mock_report_event.call_args_list[4]
-                _, enable_kwargs = mock_report_event.call_args_list[5]
+                update_kwargs = next(kwargs for _, kwargs in mock_report_event.call_args_list if
+                                     "Command: testfile.sh -update" in kwargs['message'])
+                install_kwargs = next(kwargs for _, kwargs in mock_report_event.call_args_list if
+                                      "Command: testfile.sh -install" in kwargs['message'])
+                enable_kwargs = next(kwargs for _, kwargs in mock_report_event.call_args_list if
+                                     "Command: testfile.sh -enable" in kwargs['message'])
 
                 self.assertIn("%s=%s" % (ExtCommandEnvVariable.DisableReturnCode, exit_code), update_kwargs['message'])
                 self.assertIn("%s=%s" % (ExtCommandEnvVariable.UninstallReturnCode, exit_code), install_kwargs['message'])
@@ -2448,7 +2451,7 @@ class TestExtension_Deprecated(TestExtensionBase):
         test_data = mockwiredata.WireProtocolData(mockwiredata.DATA_FILE_REQUIRED_FEATURES)
         _, protocol = self._create_mock(test_data, mock_get, mock_crypt_util, *args)
 
-        required_features = protocol.get_extensions_goal_state().required_features
+        required_features = protocol.get_goal_state().extensions_goal_state.required_features
         self.assertEqual(3, len(required_features), "Incorrect features parsed")
         for i, feature in enumerate(required_features):
             self.assertEqual(feature, "TestRequiredFeature{0}".format(i+1), "Name mismatch")
@@ -2486,13 +2489,7 @@ class TestExtensionSequencing(AgentTestCase):
         protocol.report_vm_status = MagicMock()
 
         handler = get_exthandlers_handler(protocol)
-        handler.ext_handlers, handler.last_etag = protocol.get_ext_handlers()
-        conf.get_enable_overprovisioning = Mock(return_value=False)
 
-        def reset_etag():
-            handler.last_etag = 0
-
-        handler.reset_etag = reset_etag
         return handler
 
     def _set_dependency_levels(self, dependency_levels, exthandlers_handler):
@@ -2503,20 +2500,19 @@ class TestExtensionSequencing(AgentTestCase):
         all_handlers = []
         for handler_name, level in dependency_levels:
             if handler_map.get(handler_name) is None:
-                handler = ExtHandler(name=handler_name)
-                extension = Extension(name=handler_name)
-                handler.properties.state = ExtHandlerRequestedState.Enabled
-                handler.properties.extensions.append(extension)
+                handler = Extension(name=handler_name)
+                extension = ExtensionSettings(name=handler_name)
+                handler.state = ExtensionRequestedState.Enabled
+                handler.settings.append(extension)
                 handler_map[handler_name] = handler
                 all_handlers.append(handler)
 
             handler = handler_map[handler_name]
-            for ext in handler.properties.extensions:
+            for ext in handler.settings:
                 ext.dependencyLevel = level
 
-        exthandlers_handler.ext_handlers.extHandlers = []
-        for handler in all_handlers:
-            exthandlers_handler.ext_handlers.extHandlers.append(handler)
+        exthandlers_handler.protocol.get_goal_state().extensions_goal_state._extensions *= 0
+        exthandlers_handler.protocol.get_goal_state().extensions_goal_state.extensions.extend(all_handlers)
 
     def _validate_extension_sequence(self, expected_sequence, exthandlers_handler):
         installed_extensions = [a[0].ext_handler.name for a, _ in exthandlers_handler.handle_ext_handler.call_args_list]
@@ -2536,7 +2532,6 @@ class TestExtensionSequencing(AgentTestCase):
             return status
 
         exthandlers_handler.handle_ext_handler = MagicMock()
-        exthandlers_handler.reset_etag()
 
         with patch.object(ExtHandlerInstance, "get_ext_handling_status", side_effect=get_ext_handling_status):
             with patch.object(ExtHandlerInstance, "get_handler_status", ExtHandlerStatus):
@@ -3016,10 +3011,10 @@ class TestCollectExtensionStatus(AgentTestCase):
                         os.path.join(self.lib_dir, handler_name + "-" + handler_version, "status", "0.status"))
 
         with mock_wire_protocol(DATA_FILE) as protocol:
-            exthandler = ExtHandler(name=handler_name)
-            exthandler.properties.version = handler_version
-            extension = Extension(name=handler_name, sequenceNumber=0)
-            exthandler.properties.extensions.append(extension)
+            exthandler = Extension(name=handler_name)
+            exthandler.version = handler_version
+            extension = ExtensionSettings(name=handler_name, sequenceNumber=0)
+            exthandler.settings.append(extension)
 
             return ExtHandlerInstance(exthandler, protocol), extension
 
@@ -3152,7 +3147,7 @@ class TestCollectExtensionStatus(AgentTestCase):
         def mock_read_file(file_, *args, **kwargs):
             expected_status_file_path = os.path.join(self.lib_dir,
                                                      ext_handler_i.ext_handler.name + "-" +
-                                                     ext_handler_i.ext_handler. properties.version,
+                                                     ext_handler_i.ext_handler.version,
                                                      "status", "0.status")
             if file_ == expected_status_file_path:
                 raise IOError("No such file or directory: {0}".format(expected_status_file_path))
@@ -3237,7 +3232,8 @@ class TestAdditionalLocationsExtensions(AgentTestCase):
     def tearDown(self):
         AgentTestCase.tearDown(self)
 
-    def test_additional_locations_node_is_consumed(self):
+    @patch('time.sleep')
+    def test_additional_locations_node_is_consumed(self, _):
 
         location_uri_pattern = r'https?://mock-goal-state/(?P<location_type>{0})/(?P<manifest_num>\d)/manifest.xml'\
             .format(r'(location)|(failoverlocation)|(additionalLocation)')
@@ -3299,20 +3295,22 @@ class TestAdditionalLocationsExtensions(AgentTestCase):
             if manifest_location_handler.num_times_called == 0:
                 time.sleep(.3)
                 manifest_location_handler.num_times_called += 1
-                return Exception("Failing manifest fetch from uri '{0}' for testing purposes."\
-                    .format(url))
+                return Exception("Failing manifest fetch from uri '{0}' for testing purposes.".format(url))
 
             return None
 
         manifest_location_handler.num_times_called = 0
 
-
         with mock_wire_protocol(self.test_data, http_get_handler=manifest_location_handler) as protocol:
-            ext_handlers, _ = protocol.get_ext_handlers()
+            ext_handlers = protocol.get_goal_state().extensions_goal_state.extensions
 
-            with self.assertRaises(ExtensionDownloadError):
-                protocol.client.fetch_manifest(ext_handlers.extHandlers[0].versionUris,
-                    timeout_in_minutes=0, timeout_in_ms=200)
+            download_timeout = wire._DOWNLOAD_TIMEOUT
+            wire._DOWNLOAD_TIMEOUT = datetime.timedelta(minutes=0)
+            try:
+                with self.assertRaises(ExtensionDownloadError):
+                    protocol.client.fetch_manifest(ext_handlers[0].manifest_uris)
+            finally:
+                wire._DOWNLOAD_TIMEOUT = download_timeout
 
 
 # New test cases should be added here.This class uses mock_wire_protocol
@@ -3359,123 +3357,91 @@ class TestExtension(TestExtensionBase, HttpRequestPredicates):
                 )
 
             expected_status = {
-                "version": "1.1",
-                "timestampUTC": "1970-01-01T00:00:00Z",
-                "aggregateStatus": {
-                    "guestAgentStatus": {
-                        "version": AGENT_VERSION,
-                        "status": "Ready",
-                        "formattedMessage": {
-                            "lang": "en-US",
-                            "message": "Guest Agent is running"
+                "__comment__": "The __status__ property is the actual status reported to CRP",
+                "__status__": {
+                    "version": "1.1",
+                    "timestampUTC": "1970-01-01T00:00:00Z",
+                    "aggregateStatus": {
+                        "guestAgentStatus": {
+                            "version": AGENT_VERSION,
+                            "status": "Ready",
+                            "formattedMessage": {
+                                "lang": "en-US",
+                                "message": "Guest Agent is running"
+                            }
+                        },
+                        "handlerAggregateStatus": [
+                            {
+                                "handlerVersion": "1.0.0",
+                                "handlerName": "OSTCExtensions.ExampleHandlerLinux",
+                                "status": "Ready",
+                                "code": 0,
+                                "useExactVersion": True,
+                                "formattedMessage": {
+                                    "lang": "en-US",
+                                    "message": "Plugin enabled"
+                                },
+                                "runtimeSettingsStatus": {
+                                    "settingsStatus": {
+                                        "status": {
+                                            "name": "OSTCExtensions.ExampleHandlerLinux",
+                                            "configurationAppliedTime": None,
+                                            "operation": None,
+                                            "status": "success",
+                                            "code": 0,
+                                            "formattedMessage": {
+                                                "lang": "en-US",
+                                                "message": None
+                                            }
+                                        },
+                                        "version": 1.0,
+                                        "timestampUTC": "1970-01-01T00:00:00Z"
+                                    },
+                                    "sequenceNumber": 0
+                                }
+                            }
+                        ],
+                        "vmArtifactsAggregateStatus": {
+                            "goalStateAggregateStatus": {
+                                "formattedMessage": {
+                                    "lang": "en-US",
+                                    "message": "GoalState executed successfully"
+                                },
+                                "timestampUTC": "1970-01-01T00:00:00Z",
+                                "inSvdSeqNo": "1",
+                                "status": "Success",
+                                "code": 0
+                            }
                         }
                     },
-                    "handlerAggregateStatus": [
-                        {
-                            "handlerVersion": "1.0.0",
-                            "handlerName": "OSTCExtensions.ExampleHandlerLinux",
-                            "status": "Ready",
-                            "code": 0,
-                            "useExactVersion": True,
-                            "formattedMessage": {
-                                "lang": "en-US",
-                                "message": "Plugin enabled"
-                            },
-                            "runtimeSettingsStatus": {
-                                "settingsStatus": {
-                                    "status": {
-                                        "name": "OSTCExtensions.ExampleHandlerLinux",
-                                        "configurationAppliedTime": None,
-                                        "operation": None,
-                                        "status": "success",
-                                        "code": 0
-                                    },
-                                    "version": 1,
-                                    "timestampUTC": "1970-01-01T00:00:00Z"
-                                },
-                                "sequenceNumber": 0
-                            },
-                            "supportsMultiConfig": False
-                        }
-                    ],
-                    "vmArtifactsAggregateStatus": {
-                        "goalStateAggregateStatus": {
-                            "formattedMessage": {
-                                "lang": "en-US",
-                                "message": "GoalState executed successfully"
-                            },
-                            "timestampUTC": "1970-01-01T00:00:00Z",
-                            "inSvdSeqNo": "1",
-                            "status": "Success",
-                            "code": 0
-                        }
-                    }
+                    "guestOSInfo": None,
+                    "supportedFeatures": supported_features
                 },
-                "supportedFeatures": supported_features,
-                "_metadataNotSentToCRP": {
+                "__debug__": {
                     "agentName": AGENT_NAME,
                     "daemonVersion": "0.0.0.0",
                     "pythonVersion": "Python: {0}.{1}.{2}".format(PY_VERSION_MAJOR, PY_VERSION_MINOR, PY_VERSION_MICRO),
-                    "extensionSupportedFeatures": [name for name, _ in
-                                                   get_agent_supported_features_list_for_extensions().items()]
-
+                    "extensionSupportedFeatures": [name for name, _ in get_agent_supported_features_list_for_extensions().items()],
+                    "supportsMultiConfig": {
+                        "OSTCExtensions.ExampleHandlerLinux": False
+                    }
                 }
-
             }
 
+
             exthandlers_handler.run()
-            exthandlers_handler.report_ext_handlers_status()
+            vm_status = exthandlers_handler.report_ext_handlers_status()
+            actual_status_json = json.loads(exthandlers_handler.get_ext_handlers_status_debug_info(vm_status))
 
-            status_path = os.path.join(conf.get_lib_dir(), AGENT_STATUS_FILE.format(1))
-            actual_status_json = json.loads(fileutil.read_file(status_path))
+            # Don't compare the guestOSInfo
+            status_property = actual_status_json.get("__status__")
+            self.assertIsNotNone(status_property, "The status file is missing the __status__ property")
+            self.assertIsNotNone(status_property.get("guestOSInfo"), "The status file is missing the guestOSInfo property")
+            status_property["guestOSInfo"] = None
 
-            # Popping run time attributes
             actual_status_json.pop('guestOSInfo', None)
 
             self.assertEqual(expected_status, actual_status_json)
-
-    def test_it_should_zip_waagent_status_when_incarnation_changes(self):
-        with mock_wire_protocol(mockwiredata.DATA_FILE) as protocol:
-
-            # This test checks when the incarnation changes the waagent_status file for the previous incarnation
-            # is added into the history folder for the previous incarnation and gets zipped
-
-            exthandlers_handler = get_exthandlers_handler(protocol)
-
-            temp_files = [
-                'ExtensionsConfig.1.xml',
-                'GoalState.1.xml',
-                'OSTCExtensions.ExampleHandlerLinux.1.manifest.xml',
-                'waagent_status.1.json'
-            ]
-
-            exthandlers_handler.run()
-            exthandlers_handler.report_ext_handlers_status()
-
-            # Updating incarnation to 2 , hence the history folder should have waaagent_status.1.json added under
-            # incarnation 1
-            protocol.mock_wire_data.set_incarnation(2)
-            protocol.update_goal_state()
-
-            test_subject = StateArchiver(self.tmp_dir)
-            test_subject.archive()
-
-            timestamp_zips = os.listdir(os.path.join(self.tmp_dir, "history"))
-            self.assertEqual(1, len(timestamp_zips), "Expected number of zips in history is 1 for"
-                                                     " incarnation 1(previous incarnation)")
-
-            zip_fn = timestamp_zips[0]
-            zip_fullname = os.path.join(self.tmp_dir, "history", zip_fn)
-            self.assertEqual(TestArchive.assert_zip_contains(zip_fullname, temp_files), None)
-            exthandlers_handler.run()
-            exthandlers_handler.report_ext_handlers_status()
-
-            # Updating incarnation to 3 , hence the history folder should have 2 zips files corresponding to incarnation
-            # 1 and 2
-            protocol.mock_wire_data.set_incarnation(3)
-            protocol.update_goal_state()
-            test_subject.archive()
-            self.assertEqual(2, len(os.listdir(os.path.join(self.tmp_dir, "history"))))
 
     def test_it_should_process_extensions_only_if_allowed(self):
         def assert_extensions_called(exthandlers_handler, expected_call_count=0):
@@ -3573,7 +3539,7 @@ class TestExtension(TestExtensionBase, HttpRequestPredicates):
                     exthandlers_handler.report_ext_handlers_status()
 
                     self._assert_handler_status(protocol.report_vm_status, "Ready", 1, "1.0.0")
-                    self.assertEqual("1", protocol.report_vm_status.call_args[0][0].vmAgent.vm_artifacts_aggregate_status.goal_state_aggregate_status.in_svd_seq_no, "Incarnation mismatch")
+                    self.assertEqual("1", protocol.report_vm_status.call_args[0][0].vmAgent.vm_artifacts_aggregate_status.goal_state_aggregate_status.in_svd_seq_no, "SVD sequence number mismatch")
 
 
 if __name__ == '__main__':

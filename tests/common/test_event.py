@@ -31,9 +31,10 @@ from mock import MagicMock
 from azurelinuxagent.common.utils import textutil, fileutil
 from azurelinuxagent.common import event, logger
 from azurelinuxagent.common.AgentGlobals import AgentGlobals
-from azurelinuxagent.common.event import add_event, add_periodic, add_log_event, elapsed_milliseconds, report_metric, \
+from azurelinuxagent.common.event import add_event, add_periodic, add_log_event, elapsed_milliseconds, \
     WALAEventOperation, parse_xml_event, parse_json_event, AGENT_EVENT_FILE_EXTENSION, EVENTS_DIRECTORY, \
-    TELEMETRY_EVENT_EVENT_ID, TELEMETRY_EVENT_PROVIDER_ID, TELEMETRY_LOG_EVENT_ID, TELEMETRY_LOG_PROVIDER_ID
+    TELEMETRY_EVENT_EVENT_ID, TELEMETRY_EVENT_PROVIDER_ID, TELEMETRY_LOG_EVENT_ID, TELEMETRY_LOG_PROVIDER_ID, \
+    report_metric
 from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.osutil import get_osutil
 from azurelinuxagent.common.telemetryevent import CommonTelemetryEventSchema, GuestAgentGenericLogsSchema, \
@@ -41,7 +42,8 @@ from azurelinuxagent.common.telemetryevent import CommonTelemetryEventSchema, Gu
 from azurelinuxagent.common.version import CURRENT_AGENT, CURRENT_VERSION, AGENT_EXECUTION_MODE
 from azurelinuxagent.ga.collect_telemetry_events import _CollectAndEnqueueEvents
 from tests.protocol import mockwiredata
-from tests.protocol.mocks import mock_wire_protocol, HttpRequestPredicates, MockHttpResponse
+from tests.protocol.mocks import mock_wire_protocol, MockHttpResponse
+from tests.protocol.HttpRequestPredicates import HttpRequestPredicates
 from tests.tools import AgentTestCase, data_dir, load_data, patch, skip_if_predicate_true
 from tests.utils.event_logger_tools import EventLoggerTools
 

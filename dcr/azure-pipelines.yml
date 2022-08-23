@@ -4,8 +4,6 @@ parameters:
     default:
       - agent-bvt
       - extension-telemetry-pipeline
-      - ext-seq-multiple-dependencies
-      - agent-persist-firewall
 
   - name: distros
     type: object
@@ -42,8 +40,19 @@ parameters:
         sku: "7-RAW"
         version: "latest"
         name: "rhel7Raw"
+##
+      - publisher: "microsoftcblmariner"
+        offer: "cbl-mariner"
+        sku: "cbl-mariner-1"
+        version: "latest"
+        name: "mariner1"
+##
+      - publisher: "microsoftcblmariner"
+        offer: "cbl-mariner"
+        sku: "cbl-mariner-2"
+        version: "latest"
+        name: "mariner2"
 
-# ToDo: Setup trigger for scheduled runs for develop
 trigger:
   - develop
 

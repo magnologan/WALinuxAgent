@@ -14,13 +14,16 @@
 # limitations under the License.
 #
 # Requires Python 2.6+ and Openssl 1.0+
+import glob
+import json
 import os
 import re
 import subprocess
+import threading
 
 from azurelinuxagent.common import conf
 from azurelinuxagent.common import logger
-from azurelinuxagent.common.cgroup import CpuCgroup, AGENT_NAME_TELEMETRY, MetricsCounter
+from azurelinuxagent.common.cgroup import CpuCgroup, AGENT_NAME_TELEMETRY, MetricsCounter, MemoryCgroup
 from azurelinuxagent.common.cgroupapi import CGroupsApi, SystemdCgroupsApi, SystemdRunError, EXTENSION_SLICE_PREFIX
 from azurelinuxagent.common.cgroupstelemetry import CGroupsTelemetry
 from azurelinuxagent.common.exception import ExtensionErrorCodes, CGroupsException
@@ -47,6 +50,7 @@ DefaultDependencies=no
 Before=slices.target
 [Slice]
 CPUAccounting=yes
+MemoryAccounting=yes
 """
 _EXTENSION_SLICE_CONTENTS = """
 [Unit]
@@ -55,6 +59,8 @@ DefaultDependencies=no
 Before=slices.target
 [Slice]
 CPUAccounting=yes
+CPUQuota={cpu_quota}
+MemoryAccounting=yes
 """
 LOGCOLLECTOR_SLICE = "azure-walinuxagent-logcollector.slice"
 # More info on resource limits properties in systemd here:
@@ -68,10 +74,9 @@ Before=slices.target
 CPUAccounting=yes
 CPUQuota={cpu_quota}
 MemoryAccounting=yes
-MemoryLimit={memory_limit}
 """
 _LOGCOLLECTOR_CPU_QUOTA = "5%"
-_LOGCOLLECTOR_MEMORY_LIMIT = "30M"  # K for kb, M for mb
+LOGCOLLECTOR_MEMORY_LIMIT = 30 * 1024 ** 2  # 30Mb
 
 _AGENT_DROP_IN_FILE_SLICE = "10-Slice.conf"
 _AGENT_DROP_IN_FILE_SLICE_CONTENTS = """
@@ -94,12 +99,20 @@ _DROP_IN_FILE_CPU_QUOTA_CONTENTS_FORMAT = """
 [Service]
 CPUQuota={0}
 """
-_AGENT_THROTTLED_TIME_THRESHOLD = 120  # 2 minutes
+_DROP_IN_FILE_MEMORY_ACCOUNTING = "13-MemoryAccounting.conf"
+_DROP_IN_FILE_MEMORY_ACCOUNTING_CONTENTS = """
+# This drop-in unit file was created by the Azure VM Agent.
+# Do not edit.
+[Service]
+MemoryAccounting=yes
+"""
+
 
 class DisableCgroups(object):
     ALL = "all"
     AGENT = "agent"
     EXTENSIONS = "extensions"
+
 
 def _log_cgroup_info(format_string, *args):
     message = format_string.format(*args)
@@ -120,6 +133,7 @@ class CGroupConfigurator(object):
     NOTE: with the exception of start_extension_command, none of the methods in this class
     raise exceptions (cgroup operations should not block extensions)
     """
+
     class _Impl(object):
         def __init__(self):
             self._initialized = False
@@ -129,6 +143,7 @@ class CGroupConfigurator(object):
             self._cgroups_api = None
             self._agent_cpu_cgroup_path = None
             self._agent_memory_cgroup_path = None
+            self._check_cgroups_lock = threading.RLock()  # Protect the check_cgroups which is called from Monitor thread and main loop.
 
         def initialize(self):
             try:
@@ -165,12 +180,21 @@ class CGroupConfigurator(object):
                 self.__setup_azure_slice()
 
                 cpu_controller_root, memory_controller_root = self.__get_cgroup_controllers()
-                self._agent_cpu_cgroup_path, self._agent_memory_cgroup_path = self.__get_agent_cgroups(agent_slice, cpu_controller_root, memory_controller_root)
+                self._agent_cpu_cgroup_path, self._agent_memory_cgroup_path = self.__get_agent_cgroups(agent_slice,
+                                                                                                       cpu_controller_root,
+                                                                                                       memory_controller_root)
+
+                if self._agent_cpu_cgroup_path is not None or self._agent_memory_cgroup_path is not None:
+                    self.enable()
 
                 if self._agent_cpu_cgroup_path is not None:
                     _log_cgroup_info("Agent CPU cgroup: {0}", self._agent_cpu_cgroup_path)
-                    self.enable()
+                    self.__set_cpu_quota(conf.get_agent_cpu_quota())
                     CGroupsTelemetry.track_cgroup(CpuCgroup(AGENT_NAME_TELEMETRY, self._agent_cpu_cgroup_path))
+
+                if self._agent_memory_cgroup_path is not None:
+                    _log_cgroup_info("Agent Memory cgroup: {0}", self._agent_memory_cgroup_path)
+                    CGroupsTelemetry.track_cgroup(MemoryCgroup(AGENT_NAME_TELEMETRY, self._agent_memory_cgroup_path))
 
                 _log_cgroup_info('Agent cgroups enabled: {0}', self._agent_cgroups_enabled)
 
@@ -218,7 +242,7 @@ class CGroupConfigurator(object):
             agent_service_name = get_osutil().get_service_name()
             try:
                 fragment_path = systemd.get_unit_property(agent_service_name, "FragmentPath")
-                if fragment_path != "/lib/systemd/system/{0}.service".format(agent_service_name):
+                if fragment_path != systemd.get_agent_unit_file():
                     agent_unit_files.append(fragment_path)
             except Exception as exception:
                 _log_cgroup_warning("Failed to query the agent's FragmentPath: {0}", ustr(exception))
@@ -233,7 +257,8 @@ class CGroupConfigurator(object):
             for unit_file in agent_unit_files:
                 try:
                     with open(unit_file, "r") as file_object:
-                        _log_cgroup_info("Found a custom unit file for the agent: {0}\n{1}", unit_file, file_object.read())
+                        _log_cgroup_info("Found a custom unit file for the agent: {0}\n{1}", unit_file,
+                                         file_object.read())
                 except Exception as exception:
                     _log_cgroup_warning("Can't read {0}: {1}", unit_file, ustr(exception))
 
@@ -269,7 +294,8 @@ class CGroupConfigurator(object):
             #
             cgroup2_mount_point, cgroup2_controllers = self._cgroups_api.get_cgroup2_controllers()
             if cgroup2_mount_point is not None:
-                _log_cgroup_info("cgroups v2 mounted at {0}.  Controllers: [{1}]", cgroup2_mount_point, cgroup2_controllers)
+                _log_cgroup_info("cgroups v2 mounted at {0}.  Controllers: [{1}]", cgroup2_mount_point,
+                                 cgroup2_controllers)
 
             return cpu_controller_root, memory_controller_root
 
@@ -311,6 +337,7 @@ class CGroupConfigurator(object):
             agent_drop_in_path = systemd.get_agent_drop_in_path()
             agent_drop_in_file_slice = os.path.join(agent_drop_in_path, _AGENT_DROP_IN_FILE_SLICE)
             agent_drop_in_file_cpu_accounting = os.path.join(agent_drop_in_path, _DROP_IN_FILE_CPU_ACCOUNTING)
+            agent_drop_in_file_memory_accounting = os.path.join(agent_drop_in_path, _DROP_IN_FILE_MEMORY_ACCOUNTING)
 
             files_to_create = []
 
@@ -321,8 +348,7 @@ class CGroupConfigurator(object):
                 files_to_create.append((vmextensions_slice, _VMEXTENSIONS_SLICE_CONTENTS))
 
             if not os.path.exists(logcollector_slice):
-                slice_contents = _LOGCOLLECTOR_SLICE_CONTENTS_FMT.format(cpu_quota=_LOGCOLLECTOR_CPU_QUOTA,
-                    memory_limit=_LOGCOLLECTOR_MEMORY_LIMIT)
+                slice_contents = _LOGCOLLECTOR_SLICE_CONTENTS_FMT.format(cpu_quota=_LOGCOLLECTOR_CPU_QUOTA)
 
                 files_to_create.append((logcollector_slice, slice_contents))
 
@@ -338,6 +364,13 @@ class CGroupConfigurator(object):
                 if not os.path.exists(agent_drop_in_file_cpu_accounting):
                     files_to_create.append((agent_drop_in_file_cpu_accounting, _DROP_IN_FILE_CPU_ACCOUNTING_CONTENTS))
 
+            if fileutil.findre_in_file(agent_unit_file, r"MemoryAccounting=") is not None:
+                CGroupConfigurator._Impl.__cleanup_unit_file(agent_drop_in_file_memory_accounting)
+            else:
+                if not os.path.exists(agent_drop_in_file_memory_accounting):
+                    files_to_create.append(
+                        (agent_drop_in_file_memory_accounting, _DROP_IN_FILE_MEMORY_ACCOUNTING_CONTENTS))
+
             if len(files_to_create) > 0:
                 # create the unit files, but if 1 fails remove all and return
                 try:
@@ -349,12 +382,16 @@ class CGroupConfigurator(object):
                         CGroupConfigurator._Impl.__cleanup_unit_file(unit_file)
                     return
 
-                # reload the systemd configuration; the new slices will be used once the agent's service restarts
-                try:
-                    logger.info("Executing systemctl daemon-reload...")
-                    shellutil.run_command(["systemctl", "daemon-reload"])
-                except Exception as exception:
-                    _log_cgroup_warning("daemon-reload failed (create azure slice): {0}", ustr(exception))
+                CGroupConfigurator._Impl.__reload_systemd_config()
+
+        @staticmethod
+        def __reload_systemd_config():
+            # reload the systemd configuration; the new slices will be used once the agent's service restarts
+            try:
+                logger.info("Executing systemctl daemon-reload...")
+                shellutil.run_command(["systemctl", "daemon-reload"])
+            except Exception as exception:
+                _log_cgroup_warning("daemon-reload failed (create azure slice): {0}", ustr(exception))
 
         @staticmethod
         def __create_unit_file(path, contents):
@@ -396,19 +433,26 @@ class CGroupConfigurator(object):
                     CGroupConfigurator._Impl.__cleanup_unit_file(unit_file)
                 return
 
-        def is_extension_resource_limits_setup_completed(self, extension_name):
+        def is_extension_resource_limits_setup_completed(self, extension_name, cpu_quota=None):
             unit_file_install_path = systemd.get_unit_file_install_path()
             extension_slice_path = os.path.join(unit_file_install_path,
                                                 SystemdCgroupsApi.get_extension_slice_name(extension_name))
+            cpu_quota = str(
+                cpu_quota) + "%" if cpu_quota is not None else ""  # setting an empty value resets to the default (infinity)
+            slice_contents = _EXTENSION_SLICE_CONTENTS.format(extension_name=extension_name,
+                                                              cpu_quota=cpu_quota)
             if os.path.exists(extension_slice_path):
-                return True
+                with open(extension_slice_path, "r") as file_:
+                    if file_.read() == slice_contents:
+                        return True
             return False
 
         def __get_agent_cgroups(self, agent_slice, cpu_controller_root, memory_controller_root):
             agent_unit_name = systemd.get_agent_unit_name()
 
             expected_relative_path = os.path.join(agent_slice, agent_unit_name)
-            cpu_cgroup_relative_path, memory_cgroup_relative_path = self._cgroups_api.get_process_cgroup_relative_paths("self")
+            cpu_cgroup_relative_path, memory_cgroup_relative_path = self._cgroups_api.get_process_cgroup_relative_paths(
+                "self")
 
             if cpu_cgroup_relative_path is None:
                 _log_cgroup_warning("The agent's process is not within a CPU cgroup")
@@ -417,11 +461,11 @@ class CGroupConfigurator(object):
                     _log_cgroup_info('CPUAccounting: {0}', systemd.get_unit_property(agent_unit_name, "CPUAccounting"))
                     _log_cgroup_info('CPUQuota: {0}', systemd.get_unit_property(agent_unit_name, "CPUQuotaPerSecUSec"))
                 else:
-                    cpu_cgroup_relative_path = None  # Set the path to None to prevent monitoring
                     _log_cgroup_warning(
                         "The Agent is not in the expected CPU cgroup; will not enable monitoring. Cgroup:[{0}] Expected:[{1}]",
                         cpu_cgroup_relative_path,
                         expected_relative_path)
+                    cpu_cgroup_relative_path = None  # Set the path to None to prevent monitoring
 
             if memory_cgroup_relative_path is None:
                 _log_cgroup_warning("The agent's process is not within a memory cgroup")
@@ -430,11 +474,11 @@ class CGroupConfigurator(object):
                     memory_accounting = systemd.get_unit_property(agent_unit_name, "MemoryAccounting")
                     _log_cgroup_info('MemoryAccounting: {0}', memory_accounting)
                 else:
-                    memory_cgroup_relative_path = None  # Set the path to None to prevent monitoring
                     _log_cgroup_info(
                         "The Agent is not in the expected memory cgroup; will not enable monitoring. CGroup:[{0}] Expected:[{1}]",
                         memory_cgroup_relative_path,
                         expected_relative_path)
+                    memory_cgroup_relative_path = None  # Set the path to None to prevent monitoring
 
             if cpu_controller_root is not None and cpu_cgroup_relative_path is not None:
                 agent_cpu_cgroup_path = os.path.join(cpu_controller_root, cpu_cgroup_relative_path)
@@ -462,29 +506,33 @@ class CGroupConfigurator(object):
 
         def enable(self):
             if not self.supported():
-                raise CGroupsException("Attempted to enable cgroups, but they are not supported on the current platform")
+                raise CGroupsException(
+                    "Attempted to enable cgroups, but they are not supported on the current platform")
             self._agent_cgroups_enabled = True
             self._extensions_cgroups_enabled = True
-            self.__set_cpu_quota(conf.get_agent_cpu_quota())
 
-        def disable(self, reason, disableCgroups):
-            # Todo: disable/reset extension when ext quotas introduced
-            if disableCgroups == DisableCgroups.ALL:                 # disable all
+        def disable(self, reason, disable_cgroups):
+            if disable_cgroups == DisableCgroups.ALL:  # disable all
+                # Reset quotas
+                self.__reset_agent_cpu_quota()
+                extension_services = self.get_extension_services_list()
+                for extension in extension_services:
+                    logger.info("Resetting extension : {0} and it's services: {1} CPUQuota".format(extension, extension_services[extension]))
+                    self.__reset_extension_cpu_quota(extension_name=extension)
+                    self.__reset_extension_services_cpu_quota(extension_services[extension])
+                self.__reload_systemd_config()
+
+                CGroupsTelemetry.reset()
                 self._agent_cgroups_enabled = False
                 self._extensions_cgroups_enabled = False
-                self.__reset_agent_cpu_quota()
-                CGroupsTelemetry.reset()
-            elif disableCgroups == DisableCgroups.AGENT: # disable agent
+            elif disable_cgroups == DisableCgroups.AGENT:  # disable agent
                 self._agent_cgroups_enabled = False
                 self.__reset_agent_cpu_quota()
                 CGroupsTelemetry.stop_tracking(CpuCgroup(AGENT_NAME_TELEMETRY, self._agent_cpu_cgroup_path))
-            elif disableCgroups == DisableCgroups.EXTENSIONS: # disable extensions
-                self._extensions_cgroups_enabled = False
 
             message = "[CGW] Disabling resource usage monitoring. Reason: {0}".format(reason)
             logger.info(message)  # log as INFO for now, in the future it should be logged as WARNING
             add_event(op=WALAEventOperation.CGroupsDisabled, message=message, is_success=False, log_event=False)
-
 
         @staticmethod
         def __set_cpu_quota(quota):
@@ -509,7 +557,8 @@ class CGroupConfigurator(object):
             """
             logger.info("Resetting agent's CPUQuota")
             if CGroupConfigurator._Impl.__try_set_cpu_quota(''):  # setting an empty value resets to the default (infinity)
-                CGroupsTelemetry.set_track_throttled_time(False)
+                _log_cgroup_info('CPUQuota: {0}',
+                                 systemd.get_unit_property(systemd.get_agent_unit_name(), "CPUQuotaPerSecUSec"))
 
         @staticmethod
         def __try_set_cpu_quota(quota):
@@ -533,32 +582,37 @@ class CGroupConfigurator(object):
             return True
 
         def check_cgroups(self, cgroup_metrics):
-            if not self.enabled():
-                return
-
-            errors = []
-
-            process_check_success = False
+            self._check_cgroups_lock.acquire()
             try:
-                self._check_processes_in_agent_cgroup()
-                process_check_success = True
-            except CGroupsException as exception:
-                errors.append(exception)
+                if not self.enabled():
+                    return
 
-            quota_check_success = False
-            try:
-                self._check_agent_throttled_time(cgroup_metrics)
-                quota_check_success = True
-            except CGroupsException as exception:
-                errors.append(exception)
+                errors = []
 
-            reason = "Check on cgroups failed:\n{0}".format("\n".join([ustr(e) for e in errors]))
+                process_check_success = False
+                try:
+                    self._check_processes_in_agent_cgroup()
+                    process_check_success = True
+                except CGroupsException as exception:
+                    errors.append(exception)
 
-            if not process_check_success and conf.get_cgroup_disable_on_process_check_failure():
-                self.disable(reason, DisableCgroups.ALL)
+                quota_check_success = False
+                try:
+                    if cgroup_metrics:
+                        self._check_agent_throttled_time(cgroup_metrics)
+                    quota_check_success = True
+                except CGroupsException as exception:
+                    errors.append(exception)
 
-            if not quota_check_success and conf.get_cgroup_disable_on_quota_check_failure():
-                self.disable(reason, DisableCgroups.AGENT)
+                reason = "Check on cgroups failed:\n{0}".format("\n".join([ustr(e) for e in errors]))
+
+                if not process_check_success and conf.get_cgroup_disable_on_process_check_failure():
+                    self.disable(reason, DisableCgroups.ALL)
+
+                if not quota_check_success and conf.get_cgroup_disable_on_quota_check_failure():
+                    self.disable(reason, DisableCgroups.AGENT)
+            finally:
+                self._check_cgroups_lock.release()
 
         def _check_processes_in_agent_cgroup(self):
             """
@@ -589,13 +643,16 @@ class CGroupConfigurator(object):
                     if process in (daemon, extension_handler) or process in systemd_run_commands:
                         continue
                     # systemd_run_commands contains the shell that started systemd-run, so we also need to check for the parent
-                    if self._get_parent(process) in systemd_run_commands and self._get_command(process) == 'systemd-run':
+                    if self._get_parent(process) in systemd_run_commands and self._get_command(
+                            process) == 'systemd-run':
                         continue
                     # check if the process is a command started by the agent or a descendant of one of those commands
                     current = process
                     while current != 0 and current not in agent_commands:
                         current = self._get_parent(current)
-                    if current == 0:
+                    # Verify if Process started by agent based on the marker found in process environment or process is in Zombie state.
+                    # If so, consider it as valid process in agent cgroup.
+                    if current == 0 and not (self.__is_process_descendant_of_the_agent(process) or self.__is_zombie_process(process)):
                         unexpected.append(self.__format_process(process))
                         if len(unexpected) >= 5:  # collect just a small sample
                             break
@@ -631,10 +688,45 @@ class CGroupConfigurator(object):
             return "[PID: {0}] UNKNOWN".format(pid)
 
         @staticmethod
+        def __is_process_descendant_of_the_agent(pid):
+            """
+            Returns True if the process is descendant of the agent by looking at the env flag(AZURE_GUEST_AGENT_PARENT_PROCESS_NAME)
+            that we set when the process starts otherwise False.
+            """
+            try:
+                env = '/proc/{0}/environ'.format(pid)
+                if os.path.exists(env):
+                    with open(env, "r") as env_file:
+                        environ = env_file.read()
+                        if environ and environ[-1] == '\x00':
+                            environ = environ[:-1]
+                        return "{0}={1}".format(shellutil.PARENT_PROCESS_NAME, shellutil.AZURE_GUEST_AGENT) in environ
+            except Exception:
+                pass
+            return False
+
+        @staticmethod
+        def __is_zombie_process(pid):
+            """
+            Returns True if process is in Zombie state otherwise False.
+
+            Ex: cat /proc/18171/stat
+            18171 (python3) S 18103 18103 18103 0 -1 4194624 57736 64902 0 3
+            """
+            try:
+                stat = '/proc/{0}/stat'.format(pid)
+                if os.path.exists(stat):
+                    with open(stat, "r") as stat_file:
+                        return stat_file.read().split()[2] == 'Z'
+            except Exception:
+                pass
+            return False
+
+        @staticmethod
         def _check_agent_throttled_time(cgroup_metrics):
             for metric in cgroup_metrics:
                 if metric.instance == AGENT_NAME_TELEMETRY and metric.counter == MetricsCounter.THROTTLED_TIME:
-                    if metric.value > _AGENT_THROTTLED_TIME_THRESHOLD:
+                    if metric.value > conf.get_agent_cpu_throttled_time_threshold():
                         raise CGroupsException("The agent has been throttled for {0} seconds".format(metric.value))
 
         @staticmethod
@@ -656,12 +748,17 @@ class CGroupConfigurator(object):
             TODO: Start tracking Memory Cgroups
             """
             try:
-                cpu_cgroup_path, _ = self._cgroups_api.get_unit_cgroup_paths(unit_name)
+                cpu_cgroup_path, memory_cgroup_path = self._cgroups_api.get_unit_cgroup_paths(unit_name)
 
                 if cpu_cgroup_path is None:
                     logger.info("The CPU controller is not mounted; will not track resource usage")
                 else:
                     CGroupsTelemetry.track_cgroup(CpuCgroup(unit_name, cpu_cgroup_path))
+
+                if memory_cgroup_path is None:
+                    logger.info("The Memory controller is not mounted; will not track resource usage")
+                else:
+                    CGroupsTelemetry.track_cgroup(MemoryCgroup(unit_name, memory_cgroup_path))
 
             except Exception as exception:
                 logger.info("Failed to start tracking resource usage for the extension: {0}", ustr(exception))
@@ -671,10 +768,13 @@ class CGroupConfigurator(object):
             TODO: remove Memory cgroups from tracked list.
             """
             try:
-                cpu_cgroup_path, _ = self._cgroups_api.get_unit_cgroup_paths(unit_name)
+                cpu_cgroup_path, memory_cgroup_path = self._cgroups_api.get_unit_cgroup_paths(unit_name)
 
                 if cpu_cgroup_path is not None:
                     CGroupsTelemetry.stop_tracking(CpuCgroup(unit_name, cpu_cgroup_path))
+
+                if memory_cgroup_path is not None:
+                    CGroupsTelemetry.stop_tracking(MemoryCgroup(unit_name, memory_cgroup_path))
 
             except Exception as exception:
                 logger.info("Failed to stop tracking resource usage for the extension service: {0}", ustr(exception))
@@ -688,16 +788,21 @@ class CGroupConfigurator(object):
                 cgroup_relative_path = os.path.join(_AZURE_VMEXTENSIONS_SLICE,
                                                     extension_slice_name)
 
-                cpu_cgroup_mountpoint, _ = self._cgroups_api.get_cgroup_mount_points()
+                cpu_cgroup_mountpoint, memory_cgroup_mountpoint = self._cgroups_api.get_cgroup_mount_points()
                 cpu_cgroup_path = os.path.join(cpu_cgroup_mountpoint, cgroup_relative_path)
+                memory_cgroup_path = os.path.join(memory_cgroup_mountpoint, cgroup_relative_path)
 
                 if cpu_cgroup_path is not None:
                     CGroupsTelemetry.stop_tracking(CpuCgroup(extension_name, cpu_cgroup_path))
 
+                if memory_cgroup_path is not None:
+                    CGroupsTelemetry.stop_tracking(MemoryCgroup(extension_name, memory_cgroup_path))
+
             except Exception as exception:
                 logger.info("Failed to stop tracking resource usage for the extension service: {0}", ustr(exception))
 
-        def start_extension_command(self, extension_name, command, cmd_name, timeout, shell, cwd, env, stdout, stderr, error_code=ExtensionErrorCodes.PluginUnknownFailure):
+        def start_extension_command(self, extension_name, command, cmd_name, timeout, shell, cwd, env, stdout, stderr,
+                                    error_code=ExtensionErrorCodes.PluginUnknownFailure):
             """
             Starts a command (install/enable/etc) for an extension and adds the command's PID to the extension's cgroup
             :param extension_name: The extension executing the command
@@ -713,9 +818,12 @@ class CGroupConfigurator(object):
             """
             if self.enabled():
                 try:
-                    return self._cgroups_api.start_extension_command(extension_name, command, cmd_name, timeout, shell=shell, cwd=cwd, env=env, stdout=stdout, stderr=stderr, error_code=error_code)
+                    return self._cgroups_api.start_extension_command(extension_name, command, cmd_name, timeout,
+                                                                     shell=shell, cwd=cwd, env=env, stdout=stdout,
+                                                                     stderr=stderr, error_code=error_code)
                 except SystemdRunError as exception:
-                    reason = 'Failed to start {0} using systemd-run, will try invoking the extension directly. Error: {1}'.format(extension_name, ustr(exception))
+                    reason = 'Failed to start {0} using systemd-run, will try invoking the extension directly. Error: {1}'.format(
+                        extension_name, ustr(exception))
                     self.disable(reason, DisableCgroups.ALL)
                     # fall-through and re-invoke the extension
 
@@ -723,24 +831,38 @@ class CGroupConfigurator(object):
             process = subprocess.Popen(command, shell=shell, cwd=cwd, env=env, stdout=stdout, stderr=stderr, preexec_fn=os.setsid)  # pylint: disable=W1509
             return handle_process_completion(process=process, command=command, timeout=timeout, stdout=stdout, stderr=stderr, error_code=error_code)
 
-        def setup_extension_slice(self, extension_name):
+        def __reset_extension_cpu_quota(self, extension_name):
+            """
+            Removes any CPUQuota on the extension
+
+            NOTE: This resets the quota on the extension's slice; any local overrides on the VM will take precedence
+            over this setting.
+            """
+            if self.enabled():
+                self.setup_extension_slice(extension_name, cpu_quota=None)
+
+        def setup_extension_slice(self, extension_name, cpu_quota):
             """
             Each extension runs under its own slice (Ex "Microsoft.CPlat.Extension.slice"). All the slices for
             extensions are grouped under "azure-vmextensions.slice.
 
             This method ensures that the extension slice is created. Setup should create
             under /lib/systemd/system if it is not exist.
-            TODO: set cpu and memory quotas
+            TODO: set memory quotas
             """
             if self.enabled():
                 unit_file_install_path = systemd.get_unit_file_install_path()
                 extension_slice_path = os.path.join(unit_file_install_path,
-                                                     SystemdCgroupsApi.get_extension_slice_name(extension_name))
+                                                    SystemdCgroupsApi.get_extension_slice_name(extension_name))
                 try:
-                    slice_contents = _EXTENSION_SLICE_CONTENTS.format(extension_name=extension_name)
+                    cpu_quota = str(cpu_quota) + "%" if cpu_quota is not None else ""  # setting an empty value resets to the default (infinity)
+                    _log_cgroup_info("Ensuring the {0}'s CPUQuota is {1}", extension_name, cpu_quota)
+                    slice_contents = _EXTENSION_SLICE_CONTENTS.format(extension_name=extension_name,
+                                                                      cpu_quota=cpu_quota)
                     CGroupConfigurator._Impl.__create_unit_file(extension_slice_path, slice_contents)
                 except Exception as exception:
-                    _log_cgroup_warning("Failed to create unit files for the extension slice: {0}", ustr(exception))
+                    _log_cgroup_warning("Failed to set the extension {0} slice and quotas: {1}", extension_name,
+                                        ustr(exception))
                     CGroupConfigurator._Impl.__cleanup_unit_file(extension_slice_path)
 
         def remove_extension_slice(self, extension_name):
@@ -755,39 +877,67 @@ class CGroupConfigurator(object):
                 if os.path.exists(extension_slice_path):
                     self.stop_tracking_extension_cgroups(extension_name)
                     CGroupConfigurator._Impl.__cleanup_unit_file(extension_slice_path)
-                # stop the unit gracefully; the extensions slices will be removed from /sys/fs/cgroup path
-                try:
-                    logger.info("Executing systemctl stop {0}".format(extension_slice_name))
-                    shellutil.run_command(["systemctl", "stop", extension_slice_name])
-                except Exception as exception:
-                    _log_cgroup_warning("systemctl stop failed (remove slice): {0}", ustr(exception))
 
         def set_extension_services_cpu_memory_quota(self, services_list):
             """
             Each extension service will have name, systemd path and it's quotas.
             This method ensures that drop-in files are created under service.d folder if quotas given.
             ex: /lib/systemd/system/extension.service.d/11-CPUAccounting.conf
-            TODO: set cpu and memory quotas
+            TODO: set memory quotas
             """
             if self.enabled() and services_list is not None:
                 for service in services_list:
                     service_name = service.get('name', None)
-                    unit_file_path = service.get('path', None)
+                    unit_file_path = systemd.get_unit_file_install_path()
                     if service_name is not None and unit_file_path is not None:
                         files_to_create = []
                         drop_in_path = os.path.join(unit_file_path, "{0}.d".format(service_name))
                         drop_in_file_cpu_accounting = os.path.join(drop_in_path,
                                                                    _DROP_IN_FILE_CPU_ACCOUNTING)
                         files_to_create.append((drop_in_file_cpu_accounting, _DROP_IN_FILE_CPU_ACCOUNTING_CONTENTS))
+                        drop_in_file_memory_accounting = os.path.join(drop_in_path,
+                                                                      _DROP_IN_FILE_MEMORY_ACCOUNTING)
+                        files_to_create.append(
+                            (drop_in_file_memory_accounting, _DROP_IN_FILE_MEMORY_ACCOUNTING_CONTENTS))
+
+                        cpu_quota = service.get('cpuQuotaPercentage', None)
+                        if cpu_quota is not None:
+                            cpu_quota = str(cpu_quota) + "%"
+                            _log_cgroup_info("Ensuring the {0}'s CPUQuota is {1}", service_name, cpu_quota)
+                            drop_in_file_cpu_quota = os.path.join(drop_in_path, _DROP_IN_FILE_CPU_QUOTA)
+                            cpu_quota_contents = _DROP_IN_FILE_CPU_QUOTA_CONTENTS_FORMAT.format(cpu_quota)
+                            files_to_create.append((drop_in_file_cpu_quota, cpu_quota_contents))
 
                         self.__create_all_files(files_to_create)
+                        self.__reload_systemd_config()
 
-                # reload the systemd configuration; the new unit will be used once the service restarts
+        def __reset_extension_services_cpu_quota(self, services_list):
+            """
+            Removes any CPUQuota on the extension service
+
+            NOTE: This resets the quota on the extension service's default dropin file; any local overrides on the VM will take precedence
+            over this setting.
+            """
+            if self.enabled() and services_list is not None:
+                service_name = None
                 try:
-                    logger.info("Executing systemctl daemon-reload...")
-                    shellutil.run_command(["systemctl", "daemon-reload"])
+                    for service in services_list:
+                        service_name = service.get('name', None)
+                        unit_file_path = systemd.get_unit_file_install_path()
+                        if service_name is not None and unit_file_path is not None:
+                            files_to_create = []
+                            drop_in_path = os.path.join(unit_file_path, "{0}.d".format(service_name))
+                            cpu_quota = ""  # setting an empty value resets to the default (infinity)
+                            drop_in_file_cpu_quota = os.path.join(drop_in_path, _DROP_IN_FILE_CPU_QUOTA)
+                            cpu_quota_contents = _DROP_IN_FILE_CPU_QUOTA_CONTENTS_FORMAT.format(cpu_quota)
+                            if os.path.exists(drop_in_file_cpu_quota):
+                                with open(drop_in_file_cpu_quota, "r") as file_:
+                                    if file_.read() == cpu_quota_contents:
+                                        return
+                                files_to_create.append((drop_in_file_cpu_quota, cpu_quota_contents))
+                            self.__create_all_files(files_to_create)
                 except Exception as exception:
-                    _log_cgroup_warning("daemon-reload failed (create service unit files): {0}", ustr(exception))
+                    _log_cgroup_warning('Failed to reset CPUQuota for {0} : {1}', service_name, ustr(exception))
 
         def remove_extension_services_drop_in_files(self, services_list):
             """
@@ -796,13 +946,21 @@ class CGroupConfigurator(object):
             if services_list is not None:
                 for service in services_list:
                     service_name = service.get('name', None)
-                    unit_file_path = service.get('path', None)
+                    unit_file_path = systemd.get_unit_file_install_path()
                     if service_name is not None and unit_file_path is not None:
                         files_to_cleanup = []
                         drop_in_path = os.path.join(unit_file_path, "{0}.d".format(service_name))
                         drop_in_file_cpu_accounting = os.path.join(drop_in_path,
                                                                    _DROP_IN_FILE_CPU_ACCOUNTING)
                         files_to_cleanup.append(drop_in_file_cpu_accounting)
+                        drop_in_file_memory_accounting = os.path.join(drop_in_path,
+                                                                      _DROP_IN_FILE_MEMORY_ACCOUNTING)
+                        files_to_cleanup.append(drop_in_file_memory_accounting)
+                        cpu_quota = service.get('cpuQuotaPercentage', None)
+                        if cpu_quota is not None:
+                            drop_in_file_cpu_quota = os.path.join(drop_in_path, _DROP_IN_FILE_CPU_QUOTA)
+                            files_to_cleanup.append(drop_in_file_cpu_quota)
+
                         CGroupConfigurator._Impl.__cleanup_all_files(files_to_cleanup)
                         _log_cgroup_info("Drop in files removed for {0}".format(service_name))
 
@@ -825,6 +983,31 @@ class CGroupConfigurator(object):
                     service_name = service.get('name', None)
                     if service_name is not None:
                         self.start_tracking_unit_cgroups(service_name)
+
+        @staticmethod
+        def get_extension_services_list():
+            """
+            ResourceLimits for extensions are coming from <extName>/HandlerManifest.json file.
+            Use this pattern to determine all the installed extension HandlerManifest files and
+            read the extension services if ResourceLimits are present.
+            """
+            extensions_services = {}
+            for manifest_path in glob.iglob(os.path.join(conf.get_lib_dir(), "*/HandlerManifest.json")):
+                match = re.search("(?P<extname>[\\w+\\.-]+).HandlerManifest\\.json", manifest_path)
+                if match is not None:
+                    extensions_name = match.group('extname')
+                    if not extensions_name.startswith('WALinuxAgent'):
+                        try:
+                            data = json.loads(fileutil.read_file(manifest_path))
+                            resource_limits = data[0].get('resourceLimits', None)
+                            services = resource_limits.get('services') if resource_limits else None
+                            extensions_services[extensions_name] = services
+                        except (IOError, OSError) as e:
+                            _log_cgroup_warning(
+                                'Failed to load manifest file ({0}): {1}'.format(manifest_path, e.strerror))
+                        except ValueError:
+                            _log_cgroup_warning('Malformed manifest file ({0}).'.format(manifest_path))
+            return extensions_services
 
     # unique instance for the singleton
     _instance = None

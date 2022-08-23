@@ -21,6 +21,7 @@ from azurelinuxagent.common.osutil.bigip import BigIpOSUtil
 from azurelinuxagent.common.osutil.clearlinux import ClearLinuxUtil
 from azurelinuxagent.common.osutil.coreos import CoreOSUtil
 from azurelinuxagent.common.osutil.debian import DebianOSBaseUtil, DebianOSModernUtil
+from azurelinuxagent.common.osutil.devuan import DevuanOSUtil
 from azurelinuxagent.common.osutil.default import DefaultOSUtil
 from azurelinuxagent.common.osutil.factory import _get_osutil
 from azurelinuxagent.common.osutil.freebsd import FreeBSDOSUtil
@@ -28,6 +29,7 @@ from azurelinuxagent.common.osutil.gaia import GaiaOSUtil
 from azurelinuxagent.common.osutil.iosxe import IosxeOSUtil
 from azurelinuxagent.common.osutil.openbsd import OpenBSDOSUtil
 from azurelinuxagent.common.osutil.openwrt import OpenWRTOSUtil
+from azurelinuxagent.common.osutil.photonos import PhotonOSUtil
 from azurelinuxagent.common.osutil.redhat import RedhatOSUtil, Redhat6xOSUtil
 from azurelinuxagent.common.osutil.suse import SUSEOSUtil, SUSE11OSUtil
 from azurelinuxagent.common.osutil.ubuntu import UbuntuOSUtil, Ubuntu12OSUtil, Ubuntu14OSUtil, \
@@ -186,6 +188,14 @@ class TestOsUtilFactory(AgentTestCase):
         self.assertTrue(isinstance(ret, DebianOSModernUtil))
         self.assertEqual(ret.get_service_name(), "walinuxagent")
 
+    def test_get_osutil_it_should_return_devuan(self):
+        ret = _get_osutil(distro_name="devuan",
+                          distro_code_name="",
+                          distro_full_name="",
+                          distro_version="4")
+        self.assertTrue(isinstance(ret, DevuanOSUtil))
+        self.assertEqual(ret.get_service_name(), "waagent")
+
     def test_get_osutil_it_should_return_redhat(self):
         ret = _get_osutil(distro_name="redhat",
                           distro_code_name="",
@@ -257,6 +267,13 @@ class TestOsUtilFactory(AgentTestCase):
         self.assertTrue(isinstance(ret, RedhatOSUtil))
         self.assertEqual(ret.get_service_name(), "waagent")
 
+        ret = _get_osutil(distro_name="rocky",
+                          distro_code_name="",
+                          distro_full_name="",
+                          distro_version="8")
+        self.assertTrue(isinstance(ret, RedhatOSUtil))
+        self.assertEqual(ret.get_service_name(), "waagent")
+
     def test_get_osutil_it_should_return_euleros(self):
         ret = _get_osutil(distro_name="euleros",
                           distro_code_name="",
@@ -264,6 +281,15 @@ class TestOsUtilFactory(AgentTestCase):
                           distro_full_name="")
         self.assertTrue(isinstance(ret, RedhatOSUtil))
         self.assertEqual(ret.get_service_name(), "waagent")
+
+    def test_get_osutil_it_should_return_uos(self):
+        ret = _get_osutil(distro_name="uos",
+                          distro_code_name="",
+                          distro_version="",
+                          distro_full_name="")
+        self.assertTrue(isinstance(ret, RedhatOSUtil))
+        self.assertEqual(ret.get_service_name(), "waagent")
+
 
     def test_get_osutil_it_should_return_freebsd(self):
         ret = _get_osutil(distro_name="freebsd",
@@ -311,4 +337,12 @@ class TestOsUtilFactory(AgentTestCase):
                           distro_version="",
                           distro_full_name="")
         self.assertTrue(isinstance(ret, OpenWRTOSUtil))
+        self.assertEqual(ret.get_service_name(), "waagent")
+
+    def test_get_osutil_it_should_return_photonos(self):
+        ret = _get_osutil(distro_name="photonos",
+                          distro_code_name="",
+                          distro_version="",
+                          distro_full_name="")
+        self.assertTrue(isinstance(ret, PhotonOSUtil))
         self.assertEqual(ret.get_service_name(), "waagent")

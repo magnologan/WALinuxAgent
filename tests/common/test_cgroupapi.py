@@ -48,7 +48,7 @@ class _MockedFileSystemTestCase(AgentTestCase):
 
 
 class CGroupsApiTestCase(_MockedFileSystemTestCase):
-    def test_cgroups_should_be_supported_only_on_ubuntu_16_and_later(self):
+    def test_cgroups_should_be_supported_only_on_ubuntu16_centos7dot4_redhat7dot4_and_later_versions(self):
         test_cases = [
             (['ubuntu', '16.04', 'xenial'], True),
             (['ubuntu', '16.10', 'yakkety'], True),
@@ -56,9 +56,17 @@ class CGroupsApiTestCase(_MockedFileSystemTestCase):
             (['ubuntu', '18.10', 'cosmic'], True),
             (['ubuntu', '20.04', 'focal'], True),
             (['ubuntu', '20.10', 'groovy'], True),
-            (['centos', '7.5', 'Source'], False),
-            (['redhat', '7.7', 'Maipo'], False),
-            (['redhat', '7.7.1908', 'Core'], False),
+            (['centos', '7.8', 'Source'], True),
+            (['redhat', '7.8', 'Maipo'], True),
+            (['redhat', '7.9.1908', 'Core'], True),
+            (['centos', '8.1', 'Source'], True),
+            (['redhat', '8.2', 'Maipo'], True),
+            (['redhat', '8.2.2111', 'Core'], True),
+            (['centos', '7.4', 'Source'], True),
+            (['redhat', '7.4', 'Maipo'], True),
+            (['centos', '7.5', 'Source'], True),
+            (['centos', '7.3', 'Maipo'], False),
+            (['redhat', '7.2', 'Maipo'], False),
             (['bigip', '15.0.1', 'Final'], False),
             (['gaia', '273.562', 'R80.30'], False),
             (['debian', '9.1', ''], False),
@@ -136,7 +144,7 @@ class SystemdCgroupsApiTestCase(AgentTestCase):
         original_popen = subprocess.Popen
 
         def mock_popen(command, *args, **kwargs):
-            if command.startswith('systemd-run --unit'):
+            if command.startswith('systemd-run --property'):
                 command = "echo TEST_OUTPUT"
             return original_popen(command, *args, **kwargs)
 
@@ -175,6 +183,10 @@ class SystemdCgroupsApiTestCase(AgentTestCase):
             self.assertTrue(
                 any(cg for cg in tracked.values() if cg.name == 'Microsoft.Compute.TestExtension-1.2.3' and 'cpu' in cg.path),
                 "The extension's CPU is not being tracked")
+
+            self.assertTrue(
+                any(cg for cg in tracked.values() if cg.name == 'Microsoft.Compute.TestExtension-1.2.3' and 'memory' in cg.path),
+                "The extension's Memory is not being tracked")
 
     @patch('time.sleep', side_effect=lambda _: mock_sleep())
     def test_start_extension_command_should_use_systemd_to_execute_the_command(self, _):

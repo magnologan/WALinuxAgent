@@ -71,47 +71,44 @@ def _add_wait(wait, command):
     return command
 
 
-def _get_iptables_version_command():
+def get_iptables_version_command():
     return ["iptables", "--version"]
 
 
-def _get_firewall_accept_command(wait, command, destination, owner_uid):
-    return AddFirewallRules.get_iptables_accept_command(wait, command, destination, owner_uid)
-
-
-def _get_firewall_drop_command(wait, command, destination):
-    return AddFirewallRules.get_iptables_drop_command(wait, command, destination)
-
-
-def _get_firewall_list_command(wait):
+def get_firewall_list_command(wait):
     return _add_wait(wait, ["iptables", "-t", "security", "-L", "-nxv"])
 
 
-def _get_firewall_packets_command(wait):
+def get_firewall_packets_command(wait):
     return _add_wait(wait, ["iptables", "-t", "security", "-L", "OUTPUT", "--zero", "OUTPUT", "-nxv"])
 
 
 # Precisely delete the rules created by the agent.
 # this rule was used <= 2.2.25.  This rule helped to validate our change, and determine impact.
-def _get_firewall_delete_conntrack_accept_command(wait, destination):
+def get_firewall_delete_conntrack_accept_command(wait, destination):
     return _add_wait(wait,
-                     ["iptables", "-t", "security", "-D", "OUTPUT", "-d", destination, "-p", "tcp", "-m", "conntrack",
+                     ["iptables", "-t", "security", AddFirewallRules.DELETE_COMMAND, "OUTPUT", "-d", destination, "-p", "tcp", "-m", "conntrack",
                       "--ctstate", "INVALID,NEW", "-j", "ACCEPT"])
 
 
-def _get_firewall_delete_owner_accept_command(wait, destination, owner_uid):
-    return _add_wait(wait, ["iptables", "-t", "security", "-D", "OUTPUT", "-d", destination, "-p", "tcp", "-m", "owner",
+def get_delete_accept_tcp_rule(wait, destination):
+    return AddFirewallRules.get_accept_tcp_rule(AddFirewallRules.DELETE_COMMAND, destination, wait=wait)
+
+
+def get_firewall_delete_owner_accept_command(wait, destination, owner_uid):
+    return _add_wait(wait, ["iptables", "-t", "security", AddFirewallRules.DELETE_COMMAND, "OUTPUT", "-d", destination, "-p", "tcp", "-m", "owner",
                             "--uid-owner", str(owner_uid), "-j", "ACCEPT"])
 
 
-def _get_firewall_delete_conntrack_drop_command(wait, destination):
+def get_firewall_delete_conntrack_drop_command(wait, destination):
     return _add_wait(wait,
-                     ["iptables", "-t", "security", "-D", "OUTPUT", "-d", destination, "-p", "tcp", "-m", "conntrack",
+                     ["iptables", "-t", "security", AddFirewallRules.DELETE_COMMAND, "OUTPUT", "-d", destination, "-p", "tcp", "-m", "conntrack",
                       "--ctstate", "INVALID,NEW", "-j", "DROP"])
 
 
 PACKET_PATTERN = "^\s*(\d+)\s+(\d+)\s+DROP\s+.*{0}[^\d]*$"  # pylint: disable=W1401
 ALL_CPUS_REGEX = re.compile('^cpu .*')
+ALL_MEMS_REGEX = re.compile('^Mem.*')
 
 _enable_firewall = True
 
@@ -162,7 +159,7 @@ class DefaultOSUtil(object):
             wait = self.get_firewall_will_wait()
 
             try:
-                output = shellutil.run_command(_get_firewall_packets_command(wait))
+                output = shellutil.run_command(get_firewall_packets_command(wait))
 
                 pattern = re.compile(PACKET_PATTERN.format(dst_ip))
                 for line in output.split('\n'):
@@ -171,9 +168,10 @@ class DefaultOSUtil(object):
                         return int(m.group(1))
 
             except Exception as e:
-                if isinstance(e, CommandError) and e.returncode == 3:  # pylint: disable=E1101
-                    # Transient error  that we ignore.  This code fires every loop
+                if isinstance(e, CommandError) and (e.returncode == 3 or e.returncode == 4):  # pylint: disable=E1101
+                    # Transient error that we ignore returncode 3. This code fires every loop
                     # of the daemon (60m), so we will get the value eventually.
+                    # ignore returncode 4 as temporary fix (RULE_REPLACE failed (Invalid argument))
                     return 0
                 logger.warn("Failed to get firewall packets: {0}", ustr(e))
                 return -1
@@ -189,7 +187,7 @@ class DefaultOSUtil(object):
     def get_firewall_will_wait(self):
         # Determine if iptables will serialize access
         try:
-            output = shellutil.run_command(_get_iptables_version_command())
+            output = shellutil.run_command(get_iptables_version_command())
         except Exception as e:
             msg = "Unable to determine version of iptables: {0}".format(ustr(e))
             logger.warn(msg)
@@ -220,21 +218,20 @@ class DefaultOSUtil(object):
                 if e.returncode == 2:
                     raise Exception("invalid firewall deletion rule '{0}'".format(rule))
 
-    def remove_firewall(self, dst_ip, uid):
+    def remove_firewall(self, dst_ip, uid, wait):
         # If a previous attempt failed, do not retry
         global _enable_firewall  # pylint: disable=W0603
         if not _enable_firewall:
             return False
 
         try:
-            wait = self.get_firewall_will_wait()
-
             # This rule was <= 2.2.25 only, and may still exist on some VMs.  Until 2.2.25
             # has aged out, keep this cleanup in place.
-            self._delete_rule(_get_firewall_delete_conntrack_accept_command(wait, dst_ip))
+            self._delete_rule(get_firewall_delete_conntrack_accept_command(wait, dst_ip))
 
-            self._delete_rule(_get_firewall_delete_owner_accept_command(wait, dst_ip, uid))
-            self._delete_rule(_get_firewall_delete_conntrack_drop_command(wait, dst_ip))
+            self._delete_rule(get_delete_accept_tcp_rule(wait, dst_ip))
+            self._delete_rule(get_firewall_delete_owner_accept_command(wait, dst_ip, uid))
+            self._delete_rule(get_firewall_delete_conntrack_drop_command(wait, dst_ip))
 
             return True
 
@@ -254,56 +251,62 @@ class DefaultOSUtil(object):
 
             # This rule was <= 2.2.25 only, and may still exist on some VMs.  Until 2.2.25
             # has aged out, keep this cleanup in place.
-            self._delete_rule(_get_firewall_delete_conntrack_accept_command(wait, dst_ip))
+            self._delete_rule(get_firewall_delete_conntrack_accept_command(wait, dst_ip))
         except Exception as error:
             logger.info(
                 "Unable to remove legacy firewall rule, won't try removing it again. Error: {0}".format(ustr(error)))
 
     def enable_firewall(self, dst_ip, uid):
+        """
+        It checks if every iptable rule exists and add them if not present. It returns a tuple(enable firewall success status, update rules flag)
+        enable firewall success status: Returns True if every firewall rule exists otherwise False
+        update rules flag: Returns True if rules are updated otherwise False
+        """
+        # This is to send telemetry when iptable rules updated
+        is_firewall_rules_updated = False
         # If a previous attempt failed, do not retry
         global _enable_firewall  # pylint: disable=W0603
         if not _enable_firewall:
-            return False
+            return False, is_firewall_rules_updated
 
         try:
             wait = self.get_firewall_will_wait()
 
-            # If the DROP rule exists, make no changes
+            # check every iptable rule and delete others if any rule is missing
+            #   and append every iptable rule to the end of the chain.
             try:
-                drop_rule = _get_firewall_drop_command(wait, "-C", dst_ip)
-                shellutil.run_command(drop_rule)
-                logger.verbose("Firewall appears established")
-                return True
+                if not AddFirewallRules.verify_iptables_rules_exist(wait, dst_ip, uid):
+                    self.remove_firewall(dst_ip, uid, wait)
+                    AddFirewallRules.add_iptables_rules(wait, dst_ip, uid)
+                    is_firewall_rules_updated = True
             except CommandError as e:
                 if e.returncode == 2:
-                    self.remove_firewall(dst_ip, uid)
+                    self.remove_firewall(dst_ip, uid, wait)
                     msg = "please upgrade iptables to a version that supports the -C option"
                     logger.warn(msg)
-                    raise Exception(msg)
-
-            # Otherwise, append both rules
-            try:
-                AddFirewallRules.add_iptables_rules(wait, dst_ip, uid)
+                    raise
             except Exception as error:
                 logger.warn(ustr(error))
                 raise
 
-            logger.info("Successfully added Azure fabric firewall rules")
-
-            try:
-                output = shellutil.run_command(_get_firewall_list_command(wait))
-                logger.info("Firewall rules:\n{0}".format(output))
-            except Exception as e:
-                logger.warn("Listing firewall rules failed: {0}".format(ustr(e)))
-
-            return True
+            return True, is_firewall_rules_updated
 
         except Exception as e:
             _enable_firewall = False
             logger.info("Unable to establish firewall -- "
                         "no further attempts will be made: "
                         "{0}".format(ustr(e)))
-            return False
+            return False, is_firewall_rules_updated
+
+    def get_firewall_list(self, wait=None):
+        try:
+            if wait is None:
+                wait = self.get_firewall_will_wait()
+            output = shellutil.run_command(get_firewall_list_command(wait))
+            return output
+        except Exception as e:
+            logger.warn("Listing firewall rules failed: {0}".format(ustr(e)))
+            return ""
 
     @staticmethod
     def _correct_instance_id(instance_id):
@@ -1408,6 +1411,27 @@ class DefaultOSUtil(object):
                         int(i) for i in line.split()[1:8])  # see "man proc" for a description of these fields
                     break
         return system_cpu
+
+    @staticmethod
+    def get_used_and_available_system_memory():
+        """
+        Get the contents of free -b in bytes.
+        # free -b
+        #              total        used        free      shared  buff/cache   available
+        # Mem:     8340144128   619352064  5236809728     1499136  2483982336  7426314240
+        # Swap:             0           0           0
+
+        :return: used and available memory in megabytes
+        """
+        used_mem = available_mem = 0
+        free_cmd = ["free", "-b"]
+        memory = shellutil.run_command(free_cmd)
+        for line in memory.split("\n"):
+            if ALL_MEMS_REGEX.match(line):
+                mems = line.split()
+                used_mem = int(mems[2])
+                available_mem = int(mems[6])  # see "man free" for a description of these fields
+        return used_mem/(1024 ** 2), available_mem/(1024 ** 2)
 
     def get_nic_state(self, as_string=False):
         """

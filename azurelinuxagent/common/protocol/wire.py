@@ -20,30 +20,28 @@ import json
 import os
 import random
 import time
-import uuid
-import xml.sax.saxutils as saxutils
+
 from collections import defaultdict
 from datetime import datetime, timedelta
+from xml.sax import saxutils
 
-import azurelinuxagent.common.conf as conf
-import azurelinuxagent.common.logger as logger
-import azurelinuxagent.common.utils.textutil as textutil
-from azurelinuxagent.common.agent_supported_feature import get_agent_supported_features_list_for_crp
+from azurelinuxagent.common import conf
+from azurelinuxagent.common import logger
+from azurelinuxagent.common.utils import textutil
+from azurelinuxagent.common.agent_supported_feature import get_agent_supported_features_list_for_crp, SupportedFeatureNames
 from azurelinuxagent.common.datacontract import validate_param
 from azurelinuxagent.common.event import add_event, WALAEventOperation, report_event, \
     CollectOrReportEventDebugInfo, add_periodic
 from azurelinuxagent.common.exception import ProtocolNotFoundError, \
-    ResourceGoneError, ExtensionDownloadError, InvalidContainerError, ProtocolError, HttpError
+    ResourceGoneError, ExtensionDownloadError, InvalidContainerError, ProtocolError, HttpError, ExtensionErrorCodes
 from azurelinuxagent.common.future import httpclient, bytebuffer, ustr
-from azurelinuxagent.common.protocol.extensions_goal_state import ExtensionsGoalState
-from azurelinuxagent.common.protocol.extensions_goal_state_factory import ExtensionsGoalStateFactory
 from azurelinuxagent.common.protocol.goal_state import GoalState, TRANSPORT_CERT_FILE_NAME, TRANSPORT_PRV_FILE_NAME
 from azurelinuxagent.common.protocol.hostplugin import HostPluginProtocol
 from azurelinuxagent.common.protocol.restapi import DataContract, ExtHandlerPackage, \
-    ExtHandlerPackageList, ExtHandlerVersionUri, ProvisionStatus, VMInfo, VMStatus
+    ExtHandlerPackageList, ProvisionStatus, VMInfo, VMStatus
 from azurelinuxagent.common.telemetryevent import GuestAgentExtensionEventsSchema
 from azurelinuxagent.common.utils import fileutil, restutil
-from azurelinuxagent.common.utils.archive import StateFlusher
+from azurelinuxagent.common.utils.archive import _MANIFEST_FILE_NAME
 from azurelinuxagent.common.utils.cryptutil import CryptUtil
 from azurelinuxagent.common.utils.textutil import parse_doc, findall, find, \
     findtext, gettext, remove_bom, get_bytes_from_pem, parse_json
@@ -54,22 +52,14 @@ HEALTH_REPORT_URI = "http://{0}/machine?comp=health"
 ROLE_PROP_URI = "http://{0}/machine?comp=roleProperties"
 TELEMETRY_URI = "http://{0}/machine?comp=telemetrydata"
 
-WIRE_SERVER_ADDR_FILE_NAME = "WireServer"
-INCARNATION_FILE_NAME = "Incarnation"
-GOAL_STATE_FILE_NAME = "GoalState.{0}.xml"
-VM_SETTINGS_FILE_NAME = "VmSettings.{0}.json"
-HOSTING_ENV_FILE_NAME = "HostingEnvironmentConfig.xml"
-SHARED_CONF_FILE_NAME = "SharedConfig.xml"
-REMOTE_ACCESS_FILE_NAME = "RemoteAccess.{0}.xml"
-EXT_CONF_FILE_NAME = "ExtensionsConfig.{0}.xml"
-MANIFEST_FILE_NAME = "{0}.{1}.manifest.xml"
-
 PROTOCOL_VERSION = "2012-11-30"
 ENDPOINT_FINE_NAME = "WireServer"
 
 SHORT_WAITING_INTERVAL = 1  # 1 second
 
 MAX_EVENT_BUFFER_SIZE = 2 ** 16 - 2 ** 10
+
+_DOWNLOAD_TIMEOUT = timedelta(minutes=5)
 
 
 class UploadError(HttpError):
@@ -96,8 +86,8 @@ class WireProtocol(DataContract):
         logger.info('Initializing goal state during protocol detection')
         self.client.update_goal_state(force_update=True)
 
-    def update_goal_state(self):
-        self.client.update_goal_state()
+    def update_goal_state(self, silent=False):
+        self.client.update_goal_state(silent=silent)
 
     def update_host_plugin_from_goal_state(self):
         self.client.update_host_plugin_from_goal_state()
@@ -121,13 +111,10 @@ class WireProtocol(DataContract):
         certificates = self.client.get_certs()
         return certificates.cert_list
 
-    def get_incarnation(self):
-        return self.client.get_goal_state().incarnation
-
     def get_vmagent_manifests(self):
         goal_state = self.client.get_goal_state()
-        ext_conf = self.client.get_extensions_goal_state()
-        return ext_conf.vmagent_manifests, goal_state.incarnation
+        ext_conf = goal_state.extensions_goal_state
+        return ext_conf.agent_manifests, goal_state.incarnation
 
     def get_vmagent_pkgs(self, vmagent_manifest):
         goal_state = self.client.get_goal_state()
@@ -135,39 +122,13 @@ class WireProtocol(DataContract):
         valid_pkg_list = ga_manifest.pkg_list
         return valid_pkg_list
 
-    def get_ext_handlers(self):
-        logger.verbose("Get extension handler config")
-        goal_state = self.client.get_goal_state()
-        extensions_goal_state = self.client.get_extensions_goal_state()
-        # In wire protocol, incarnation is equivalent to ETag
-        return extensions_goal_state.ext_handlers, goal_state.incarnation
-
     def get_ext_handler_pkgs(self, ext_handler):
         logger.verbose("Get extension handler package")
         man = self.client.get_ext_manifest(ext_handler)
         return man.pkg_list
 
-    def get_extensions_goal_state(self):
-        return self.client.get_extensions_goal_state()
-
-    def _download_ext_handler_pkg_through_host(self, uri, destination):
-        host = self.client.get_host_plugin()
-        uri, headers = host.get_artifact_request(uri, host.manifest_uri)
-        success = self.client.stream(uri, destination, headers=headers, use_proxy=False, max_retry=1)
-        return success
-
-    def download_ext_handler_pkg(self, uri, destination, headers=None, use_proxy=True):  # pylint: disable=W0613
-        direct_func = lambda: self.client.stream(uri, destination, headers=None, use_proxy=True, max_retry=1)
-        # NOTE: the host_func may be called after refreshing the goal state, be careful about any goal state data
-        # in the lambda.
-        host_func = lambda: self._download_ext_handler_pkg_through_host(uri, destination)
-
-        try:
-            success = self.client.send_request_using_appropriate_channel(direct_func, host_func) is not None
-        except Exception:
-            success = False
-
-        return success
+    def get_goal_state(self):
+        return self.client.get_goal_state()
 
     def report_provision_status(self, provision_status):
         validate_param("provision_status", provision_status, ProvisionStatus)
@@ -299,7 +260,21 @@ def ga_status_to_v1(ga_status):
         "status": ga_status.status,
         "formattedMessage": __get_formatted_msg_for_status_reporting(ga_status.message)
     }
+
+    if ga_status.update_status is not None:
+        v1_ga_status["updateStatus"] = get_ga_update_status_to_v1(ga_status.update_status)
+
     return v1_ga_status
+
+
+def get_ga_update_status_to_v1(update_status):
+    v1_ga_update_status = {
+        "expectedVersion": update_status.expected_version,
+        "status": update_status.status,
+        "code": update_status.code,
+        "formattedMessage": __get_formatted_msg_for_status_reporting(update_status.message)
+    }
+    return v1_ga_update_status
 
 
 def ext_substatus_to_v1(sub_status_list):
@@ -413,6 +388,13 @@ def vm_status_to_v1(vm_status):
             {
                 "Key": feature.name,
                 "Value": feature.version
+            }
+        )
+    if vm_status.vmAgent.supports_fast_track:
+        supported_features.append(
+            {
+                "Key": SupportedFeatureNames.FastTrack,
+                "Value": "1.0"  # This is a dummy version; CRP ignores it
             }
         )
     if supported_features:
@@ -568,12 +550,8 @@ class WireClient(object):
         logger.info("Wire server endpoint:{0}", endpoint)
         self._endpoint = endpoint
         self._goal_state = None
-        self._extensions_goal_state = None  # goal state from ExtensionsConfig
-        self._extensions_goal_state_from_vm_settings = None  # goal state from vmSettings
         self._host_plugin = None
         self.status_blob = StatusBlob(self)
-        self.goal_state_flusher = StateFlusher(conf.get_lib_dir())
-        self._vm_settings_error_reporter = _ErrorReporter(WALAEventOperation.VmSettings)
 
     def get_endpoint(self):
         return self._endpoint
@@ -595,8 +573,7 @@ class WireClient(object):
             raise
 
         except Exception as e:
-            raise ProtocolError("[Wireserver Exception] {0}".format(
-                ustr(e)))
+            raise ProtocolError("[Wireserver Exception] {0}".format(ustr(e)))
 
         return resp
 
@@ -608,27 +585,8 @@ class WireClient(object):
         return xml_text
 
     def fetch_config(self, uri, headers):
-        resp = self.call_wireserver(restutil.http_get,
-                                    uri,
-                                    headers=headers)
+        resp = self.call_wireserver(restutil.http_get, uri, headers=headers)
         return self.decode_config(resp.read())
-
-    def fetch_cache(self, local_file):
-        if not os.path.isfile(local_file):
-            raise ProtocolError("{0} is missing.".format(local_file))
-        try:
-            return fileutil.read_file(local_file)
-        except IOError as e:
-            raise ProtocolError("Failed to read cache: {0}".format(e))
-
-    @staticmethod
-    def _save_cache(data, file_name):
-        try:
-            file_path = os.path.join(conf.get_lib_dir(), file_name)
-            fileutil.write_file(file_path, data)
-        except IOError as e:
-            fileutil.clean_ioerror(e, paths=[file_name])
-            raise ProtocolError("Failed to write cache: {0}".format(e))
 
     @staticmethod
     def call_storage_service(http_req, *args, **kwargs):
@@ -638,91 +596,134 @@ class WireClient(object):
 
         return http_req(*args, **kwargs)
 
-    def fetch_manifest_through_host(self, uri):
-        host = self.get_host_plugin()
-        uri, headers = host.get_artifact_request(uri)
-        response, _ = self.fetch(uri, headers, use_proxy=False, max_retry=1)
-        return response
+    def fetch_artifacts_profile_blob(self, uri):
+        return self._fetch_content("artifacts profile blob", [uri])[1]  # _fetch_content returns a (uri, content) tuple
 
-    def fetch_manifest(self, version_uris, timeout_in_minutes=5, timeout_in_ms=0):
-        logger.verbose("Fetch manifest")
-        version_uris_shuffled = version_uris
-        random.shuffle(version_uris_shuffled)
+    def fetch_manifest(self, uris):
+        uri, content = self._fetch_content("manifest", uris)
+        self.get_host_plugin().update_manifest_uri(uri)
+        return content
 
-        uris_tried = 0
+    def _fetch_content(self, download_type, uris):
+        """
+        Walks the given list of 'uris' issuing HTTP GET requests; returns a tuple with the URI and the content of the first successful request.
+
+        The 'download_type' is added to any log messages produced by this method; it should describe the type of content of the given URIs
+        (e.g. "manifest", "extension package", etc).
+        """
+        host_ga_plugin = self.get_host_plugin()
+
+        direct_download = lambda uri: self.fetch(uri)[0]
+
+        def hgap_download(uri):
+            request_uri, request_headers = host_ga_plugin.get_artifact_request(uri)
+            response, _ = self.fetch(request_uri, request_headers, use_proxy=False, retry_codes=restutil.HGAP_GET_EXTENSION_ARTIFACT_RETRY_CODES)
+            return response
+
+        return self._download_with_fallback_channel(download_type, uris, direct_download=direct_download, hgap_download=hgap_download)
+
+    def download_extension(self, uris, destination, on_downloaded=lambda: True):
+        """
+        Walks the given list of 'uris' issuing HTTP GET requests and saves the content of the first successful request to 'destination'.
+
+        When the download is successful, this method invokes the 'on_downloaded' callback function, which can be used to process the results of the download.
+        on_downloaded() should return True on success and False on failure (it should not raise any exceptions); ff the return value is False, the download
+        is considered a failure and the next URI is tried.
+        """
+        host_ga_plugin = self.get_host_plugin()
+
+        direct_download = lambda uri: self.stream(uri, destination, headers=None, use_proxy=True)
+
+        def hgap_download(uri):
+            request_uri, request_headers = host_ga_plugin.get_artifact_request(uri, host_ga_plugin.manifest_uri)
+            return self.stream(request_uri, destination, headers=request_headers, use_proxy=False)
+
+        self._download_with_fallback_channel("extension package", uris, direct_download=direct_download, hgap_download=hgap_download, on_downloaded=on_downloaded)
+
+    def _download_with_fallback_channel(self, download_type, uris, direct_download, hgap_download, on_downloaded=lambda: True):
+        """
+        Walks the given list of 'uris' issuing HTTP GET requests, attempting to download the content of each URI. The download is done using both the default and
+        the fallback channels, until one of them succeeds. The 'direct_download' and 'hgap_download' functions define the logic to do direct calls to the URI or
+        to use the HostGAPlugin as a proxy for the download. Initially the default channel is the direct download and the fallback channel is the HostGAPlugin,
+        but the default can be depending on the success/failure of each channel (see _download_using_appropriate_channel() for the logic to do this).
+
+        The 'download_type' is added to any log messages produced by this method; it should describe the type of content of the given URIs
+        (e.g. "manifest", "extension package", etc).
+
+        When the download is successful download_extension() invokes the 'on_downloaded' function, which can be used to process the results of the download. This
+        function should return True on success, and False on failure (it should not raise any exceptions). If the return value is False, the download is considered
+        a failure and the next URI is tried.
+
+        When the download succeeds, this method returns a (uri, response) tuple where the first item is the URI of the successful download and the second item is
+        the response returned by the successful channel (i.e. one of direct_download and hgap_download).
+
+        This method enforces a timeout (_DOWNLOAD_TIMEOUT) on the download and raises an exception if the limit is exceeded.
+        """
+        logger.verbose("Downloading {0}", download_type)
         start_time = datetime.now()
-        for version in version_uris_shuffled:
 
-            if datetime.now() - start_time > timedelta(minutes=timeout_in_minutes, milliseconds=timeout_in_ms):
-                logger.warn("Agent timed-out after {0} minutes while fetching extension manifests. {1}/{2} uris tried.",
-                    timeout_in_minutes, uris_tried, len(version_uris))
-                break
+        uris_shuffled = uris
+        random.shuffle(uris_shuffled)
+        most_recent_error = "None"
 
-            # GA expects a location and failoverLocation in ExtensionsConfig, but
-            # this is not always the case. See #1147.
-            if version.uri is None:
-                logger.verbose('The specified manifest URL is empty, ignored.')
-                continue
-
-            direct_func = lambda: self.fetch(version.uri, max_retry=1)[0]  # pylint: disable=W0640
-            # NOTE: the host_func may be called after refreshing the goal state, be careful about any goal state data
-            # in the lambda.
-            host_func = lambda: self.fetch_manifest_through_host(version.uri)  # pylint: disable=W0640
+        for index, uri in enumerate(uris_shuffled):
+            elapsed = datetime.now() - start_time
+            if elapsed > _DOWNLOAD_TIMEOUT:
+                message = "Timeout downloading {0}. Elapsed: {1} URIs tried: {2}/{3}. Last error: {4}".format(download_type, elapsed, index, len(uris), ustr(most_recent_error))
+                raise ExtensionDownloadError(message, code=ExtensionErrorCodes.PluginManifestDownloadError)
 
             try:
-                manifest = self.send_request_using_appropriate_channel(direct_func, host_func)
-                if manifest is not None:
-                    host = self.get_host_plugin()
-                    host.update_manifest_uri(version.uri)
-                    return manifest
-            except Exception as error:
-                logger.warn("Failed to fetch manifest from {0}. Error: {1}", version.uri, ustr(error))
+                # Disable W0640: OK to use uri in a lambda within the loop's body
+                response = self._download_using_appropriate_channel(lambda: direct_download(uri), lambda: hgap_download(uri))  # pylint: disable=W0640
 
-            uris_tried += 1
+                if on_downloaded():
+                    return uri, response
 
-        raise ExtensionDownloadError("Failed to fetch manifest from all sources")
+            except Exception as exception:
+                most_recent_error = exception
 
-    def stream(self, uri, destination, headers=None, use_proxy=None, max_retry=None):
+        raise ExtensionDownloadError("Failed to download {0} from all URIs. Last error: {1}".format(download_type, ustr(most_recent_error)), code=ExtensionErrorCodes.PluginManifestDownloadError)
+
+    def stream(self, uri, destination, headers=None, use_proxy=None):
         """
-        max_retry indicates the maximum number of retries for the HTTP request; None indicates that the default value should be used
+        Downloads the content of the given 'uri' and saves it to the 'destination' file.
         """
-        success = False
-        logger.verbose("Fetch [{0}] with headers [{1}] to file [{2}]", uri, headers, destination)
+        try:
+            logger.verbose("Fetch [{0}] with headers [{1}] to file [{2}]", uri, headers, destination)
 
-        response = self._fetch_response(uri, headers, use_proxy,  max_retry=max_retry)
-        if response is not None and not restutil.request_failed(response):
-            chunk_size = 1024 * 1024  # 1MB buffer
-            try:
+            response = self._fetch_response(uri, headers, use_proxy)
+            if response is not None and not restutil.request_failed(response):
+                chunk_size = 1024 * 1024  # 1MB buffer
                 with open(destination, 'wb', chunk_size) as destination_fh:
                     complete = False
                     while not complete:
                         chunk = response.read(chunk_size)
                         destination_fh.write(chunk)
                         complete = len(chunk) < chunk_size
-                success = True
-            except Exception as error:
-                logger.error('Error streaming {0} to {1}: {2}'.format(uri, destination, ustr(error)))
+            return ""
+        except:
+            if os.path.exists(destination):  # delete the destination file, in case we did a partial download
+                try:
+                    os.remove(destination)
+                except Exception as exception:
+                    logger.warn("Can't delete {0}: {1}", destination, ustr(exception))
+            raise
 
-        return success
-
-    def fetch(self, uri, headers=None, use_proxy=None, decode=True, max_retry=None, ok_codes=None):
+    def fetch(self, uri, headers=None, use_proxy=None, decode=True, retry_codes=None, ok_codes=None):
         """
-        max_retry indicates the maximum number of retries for the HTTP request; None indicates that the default value should be used
-
         Returns a tuple with the content and headers of the response. The headers are a list of (name, value) tuples.
         """
         logger.verbose("Fetch [{0}] with headers [{1}]", uri, headers)
         content = None
-        response = self._fetch_response(uri, headers, use_proxy, max_retry=max_retry, ok_codes=ok_codes)
+        response_headers = None
+        response = self._fetch_response(uri, headers, use_proxy, retry_codes=retry_codes, ok_codes=ok_codes)
         if response is not None and not restutil.request_failed(response, ok_codes=ok_codes):
             response_content = response.read()
             content = self.decode_config(response_content) if decode else response_content
-        return content, response.getheaders()
+            response_headers = response.getheaders()
+        return content, response_headers
 
-    def _fetch_response(self, uri, headers=None, use_proxy=None, max_retry=None, ok_codes=None):
-        """
-        max_retry indicates the maximum number of retries for the HTTP request; None indicates that the default value should be used
-        """
+    def _fetch_response(self, uri, headers=None, use_proxy=None, retry_codes=None, ok_codes=None):
         resp = None
         try:
             resp = self.call_storage_service(
@@ -730,7 +731,7 @@ class WireClient(object):
                 uri,
                 headers=headers,
                 use_proxy=use_proxy,
-                max_retry=max_retry)
+                retry_codes=retry_codes)
 
             host_plugin = self.get_host_plugin()
 
@@ -753,10 +754,7 @@ class WireClient(object):
             msg = "Fetch failed: {0}".format(error)
             logger.warn(msg)
             report_event(op=WALAEventOperation.HttpGet, is_success=False, message=msg, log_event=False)
-
-            if isinstance(error, (InvalidContainerError, ResourceGoneError)):
-                # These are retryable errors that should force a goal state refresh in the host plugin
-                raise
+            raise
 
         return resp
 
@@ -764,173 +762,31 @@ class WireClient(object):
         """
         Fetches a new goal state and updates the Container ID and Role Config Name of the host plugin client
         """
-        goal_state = GoalState(self)
-        self._update_host_plugin(goal_state.container_id, goal_state.role_config_name)
+        if self._host_plugin is not None:
+            GoalState.update_host_plugin_headers(self)
 
-    def update_goal_state(self, force_update=False):
-        """
-        Updates the goal state if the incarnation or etag changed or if 'force_update' is True
-        """
-        try:
-            updated = False
-
-            goal_state = GoalState(self)
-
-            # Always update the hostgaplugin, since the agent may issue requests to it even if there are no other changes
-            # in the goal state (e.g. report status)
-            self._update_host_plugin(goal_state.container_id, goal_state.role_config_name)
-
-            if force_update:
-                logger.info("Forcing an update of the goal state..")
-
-            fetch_full_goal_state = force_update or \
-                self._goal_state is None or self._extensions_goal_state is None or \
-                self._goal_state.incarnation != goal_state.incarnation
-
-            #
-            # TODO: Today we always update self._extensions_goal_state using the ExtensionsConfig. After that, (unless
-            #       FastTrack is disabled in waagent.conf) we query the vmSettings only to compare them against the
-            #       ExtensionsConfig.
-            #       When FastTrack is fully implemented, we will need instead to update self._extensions_goal_state
-            #       from the vmSettings and fallback to the ExtensionsConfig only if FastTrack is disabled or if it is
-            #       not supported by the HostGAPlugin.
-            #       Extensions processing is always based on self._extensions_goal_state, while self._extensions_goal_state_from_vm_settings
-            #       is currently held only for debugging purposes.
-            #
-            if fetch_full_goal_state:
-                goal_state.fetch_full_goal_state(self)
-                self._goal_state = goal_state
-                if self._goal_state.extensions_config_uri is None:
-                    self._extensions_goal_state = ExtensionsGoalStateFactory.create_empty()
-                else:
-                    xml_text = self.fetch_config(self._goal_state.extensions_config_uri, self.get_header())
-                    self._extensions_goal_state = ExtensionsGoalStateFactory.create_from_extensions_config(goal_state.incarnation, xml_text, self)
-                updated = True
-
-            if conf.get_enable_fast_track():
-                # Since currently we query vmSettings only to exercise the HostGAPlugin, errors in this section of the code should not
-                # prevent the agent from processing the goal state; we simply report a summary of those errors.
-                try:
-                    request_etag = None if force_update or self._extensions_goal_state_from_vm_settings is None else self._extensions_goal_state_from_vm_settings.id
-                    response_etag, vm_settings = self._fetch_vm_settings(request_etag)
-                    if vm_settings is not None:  # vmSettings is None when there has not been a new goal state, or the HostGAPlugin does not support FastTrack
-                        self._extensions_goal_state_from_vm_settings = ExtensionsGoalStateFactory.create_from_vm_settings(response_etag, vm_settings)
-                        updated = True
-                    # If either goal state was updated, compare them
-                    if updated and self._extensions_goal_state_from_vm_settings is not None:
-                        ExtensionsGoalState.compare(self._extensions_goal_state, self._extensions_goal_state_from_vm_settings)
-                except Exception as error:
-                    # TODO: Once FastTrack is stable, these exceptions should be rare. Add a traceback to the error message at that point.
-                    self._vm_settings_error_reporter.report_error(ustr(error))
-                self._vm_settings_error_reporter.report_summary()
-
-            # If either goal state was updated, save them
-            if updated:
-                self._save_goal_state()
-
-        except Exception as exception:
-            raise ProtocolError("Error fetching goal state: {0}".format(ustr(exception)))
-
-    def _fetch_vm_settings(self, etag):
-        """
-        Queries the vmSettings from the HostGAPlugin using the given etag, returns a tuple of the response's etag and content.
-        If the vmSettings have not been updated for the given etag, or if the HostGAPlugin does not support FastTrack,
-        returns (None, None).
-        """
-        correlation_id = str(uuid.uuid4())
-
-        try:
-            def get_vm_settings():
-                url, headers = self.get_host_plugin().get_vm_settings_request(correlation_id)
-                if etag is not None:
-                    headers['if-none-match'] = etag
-                return restutil.http_get(url, headers=headers, use_proxy=False, max_retry=1)
-
-            try:
-                response = get_vm_settings()
-            except ResourceGoneError:  # retry after refreshing the HostGAPlugin
-                self.update_host_plugin_from_goal_state()
-                response = get_vm_settings()
-
-            if response.status == httpclient.NOT_MODIFIED:
-                return None, None
-
-            # TODO: Currently we use the vmSettings just to compare against ExtensionsConfig and we handle
-            #       Not Supported just as if there was no update in the vmSettings. Once FastTrack is
-            #       fully enabled, if the HostGAPlugin does not support FastTrack we actually need to
-            #       fallback to using the ExtensionsConfig
-            if response.status == httpclient.NOT_FOUND:  # the HostGAPlugin does not support FastTrack
-                return None, None
-            # END TODO
-
-            if response.status != httpclient.OK:
-                error_description = restutil.read_response_error(response)
-                # For historical reasons the HostGAPlugin returns 502 (BAD_GATEWAY) for internal errors instead of using
-                # 500 (INTERNAL_SERVER_ERROR). We add a short prefix to the error message in the hope that it will help
-                # clear any confusion produced by the poor choice of status code.
-                if response.status == httpclient.BAD_GATEWAY:
-                    error_description = "[Internal error in HostGAPlugin] {0}".format(error_description)
-                raise ProtocolError("GET vmSettings [correlation ID: {0}]: {1} ({2})".format(correlation_id, response.status, error_description))
-
-            for h in response.getheaders():
-                if h[0].lower() == 'etag':
-                    response_etag = h[1]
-                    break
-            else:  # since the vmSettings were updated, the response must include an etag
-                raise ProtocolError("The vmSettings do no include an Etag [correlation ID: {0}]".format(correlation_id))
-
-            logger.info("Fetched new vmSettings [correlation ID: {0} New eTag: {1}]", correlation_id, response_etag)
-            response_content = self.decode_config(response.read())
-            return response_etag, response_content
-
-        except ProtocolError:
-            raise
-        except HttpError as http_error:
-            raise Exception("{0} [correlation ID: {1} eTag: {2}]".format(ustr(http_error), correlation_id, etag))
-        except Exception as exception:
-            error = textutil.format_exception(exception)  # since this is a generic error, we format the exception to include the traceback
-            raise Exception("Error fetching vmSettings [correlation ID: {0} eTag: {1}]: {2}".format(correlation_id, etag, error))
-
-    def _update_host_plugin(self, container_id, role_config_name):
+    def update_host_plugin(self, container_id, role_config_name):
         if self._host_plugin is not None:
             self._host_plugin.update_container_id(container_id)
             self._host_plugin.update_role_config_name(role_config_name)
 
-    def _save_goal_state(self):
+    def update_goal_state(self, force_update=False, silent=False):
+        """
+        Updates the goal state if the incarnation or etag changed or if 'force_update' is True
+        """
         try:
-            self.goal_state_flusher.flush()
-        except Exception as e:
-            logger.warn("Failed to save the previous goal state to the history folder: {0}", ustr(e))
+            if force_update and not silent:
+                logger.info("Forcing an update of the goal state.")
 
-        try:
-            def save_if_not_none(goal_state_property, file_name):
-                if goal_state_property is not None and goal_state_property.xml_text is not None:
-                    self._save_cache(goal_state_property.xml_text, file_name)
+            if self._goal_state is None or force_update:
+                self._goal_state = GoalState(self, silent=silent)
+            else:
+                self._goal_state.update(silent=silent)
 
-            # NOTE: Certificates are saved in Certificate.__init__
-            self._save_cache(self._goal_state.incarnation, INCARNATION_FILE_NAME)
-            save_if_not_none(self._goal_state, GOAL_STATE_FILE_NAME.format(self._goal_state.incarnation))
-            save_if_not_none(self._goal_state.hosting_env, HOSTING_ENV_FILE_NAME)
-            save_if_not_none(self._goal_state.shared_conf, SHARED_CONF_FILE_NAME)
-            save_if_not_none(self._goal_state.remote_access, REMOTE_ACCESS_FILE_NAME.format(self._goal_state.incarnation))
-            if self._extensions_goal_state is not None:
-                text = self._extensions_goal_state.get_redacted_text()
-                if text != '':
-                    self._save_cache(text, EXT_CONF_FILE_NAME.format(self._extensions_goal_state.id))
-            # TODO: When Fast Track is fully enabled self._extensions_goal_state_from_vm_settings will go away and this can be deleted
-            if self._extensions_goal_state_from_vm_settings is not None:
-                text = self._extensions_goal_state_from_vm_settings.get_redacted_text()
-                if text != '':
-                    self._save_cache(text, VM_SETTINGS_FILE_NAME.format(self._extensions_goal_state_from_vm_settings.id))
-            # END TODO
-
-        except Exception as e:
-            logger.warn("Failed to save the goal state to disk: {0}", ustr(e))
-
-    def _set_host_plugin(self, new_host_plugin):
-        if new_host_plugin is None:
-            logger.warn("Setting empty Host Plugin object!")
-        self._host_plugin = new_host_plugin
+        except ProtocolError:
+            raise
+        except Exception as exception:
+            raise ProtocolError("Error fetching goal state: {0}".format(ustr(exception)))
 
     def get_goal_state(self):
         if self._goal_state is None:
@@ -952,18 +808,13 @@ class WireClient(object):
             raise ProtocolError("Trying to fetch Certificates before initialization!")
         return self._goal_state.certs
 
-    def get_extensions_goal_state(self):
-        if self._extensions_goal_state is None:
-            raise ProtocolError("Trying to fetch ExtensioalState before initialization!")
-        return self._extensions_goal_state
-
     def get_ext_manifest(self, ext_handler):
         if self._goal_state is None:
             raise ProtocolError("Trying to fetch Extension Manifest before initialization!")
 
         try:
-            xml_text = self.fetch_manifest(ext_handler.versionUris)
-            self._save_cache(xml_text, MANIFEST_FILE_NAME.format(ext_handler.name, self.get_goal_state().incarnation))
+            xml_text = self.fetch_manifest(ext_handler.manifest_uris)
+            self._goal_state.save_to_history(xml_text, _MANIFEST_FILE_NAME.format(ext_handler.name))
             return ExtensionManifest(xml_text)
         except Exception as e:
             raise ExtensionDownloadError("Failed to retrieve extension manifest. Error: {0}".format(ustr(e)))
@@ -974,12 +825,9 @@ class WireClient(object):
         return self._goal_state.remote_access
 
     def fetch_gafamily_manifest(self, vmagent_manifest, goal_state):
-        local_file = MANIFEST_FILE_NAME.format(vmagent_manifest.family, goal_state.incarnation)
-        local_file = os.path.join(conf.get_lib_dir(), local_file)
-
         try:
-            xml_text = self.fetch_manifest(vmagent_manifest.versionsManifestUris)
-            fileutil.write_file(local_file, xml_text)
+            xml_text = self.fetch_manifest(vmagent_manifest.uris)
+            goal_state.save_to_history(xml_text, _MANIFEST_FILE_NAME.format(vmagent_manifest.family))
             return ExtensionManifest(xml_text)
         except Exception as e:
             raise ProtocolError("Failed to retrieve GAFamily manifest. Error: {0}".format(ustr(e)))
@@ -1004,14 +852,9 @@ class WireClient(object):
         """
         Calls host_func on host channel and accounts for stale resource (ResourceGoneError or InvalidContainerError).
         If stale, it refreshes the goal state and retries host_func.
-        This method can throw, so the callers need to handle that.
         """
         try:
-            ret = host_func()
-            if ret in (None, False):
-                raise Exception("Request failed using the host channel.")
-
-            return ret
+            return host_func()
         except (ResourceGoneError, InvalidContainerError) as error:
             host_plugin = self.get_host_plugin()
 
@@ -1030,9 +873,6 @@ class WireClient(object):
 
             try:
                 ret = host_func()
-
-                if ret in (None, False):
-                    raise Exception("Request failed using the host channel after goal state refresh.")
 
                 msg = "[PERIODIC] Request succeeded using the host plugin channel after goal state refresh. " \
                       "ContainerId changed from {0} to {1}, " \
@@ -1060,81 +900,49 @@ class WireClient(object):
                              log_event=True)
                 raise
 
-    def __send_request_using_host_channel(self, host_func):
+    def _download_using_appropriate_channel(self, direct_download, hgap_download):
         """
-        Calls the host_func on host channel with retries for stale goal state and handles any exceptions, consistent with the caller for direct channel.
-        At the time of writing, host_func internally calls either:
-        1) WireClient.stream which returns a boolean, or
-        2) WireClient.fetch which returns None or a HTTP response.
-        This method returns either None (failure case where host_func returned None or False), True or an HTTP response.
+        Does a download using both the default and fallback channels. By default, the primary channel is direct, host channel is the fallback.
+        We call the primary channel first and return on success. If primary fails, we try the fallback. If fallback fails,
+        we return and *don't* switch the default channel. If fallback succeeds, we change the default channel.
         """
-        ret = None
-        try:
-            ret = self._call_hostplugin_with_container_check(host_func)
-        except Exception as error:
-            logger.periodic_info(logger.EVERY_HOUR, "[PERIODIC] Request failed using the host channel. Error: {0}".format(ustr(error)))
-
-        return ret
-
-    @staticmethod
-    def __send_request_using_direct_channel(direct_func):
-        """
-        Calls the direct_func on direct channel and handles any exceptions, consistent with the caller for host channel.
-        At the time of writing, direct_func internally calls either:
-        1) WireClient.stream which returns a boolean, or
-        2) WireClient.fetch which returns None or a HTTP response.
-        This method returns either None (failure case where direct_func returned None or False), True or an HTTP response.
-        """
-        ret = None
-        try:
-            ret = direct_func()
-
-            if ret in (None, False):
-                logger.periodic_info(logger.EVERY_HOUR, "[PERIODIC] Request failed using the direct channel.")
-                return None
-        except Exception as error:
-            logger.periodic_info(logger.EVERY_HOUR, "[PERIODIC] Request failed using the direct channel. Error: {0}".format(ustr(error)))
-
-        return ret
-
-    def send_request_using_appropriate_channel(self, direct_func, host_func):
-        """
-        Determines which communication channel to use. By default, the primary channel is direct, host channel is secondary.
-        We call the primary channel first and return on success. If primary fails, we try secondary. If secondary fails,
-        we return and *don't* switch the default channel. If secondary succeeds, we change the default channel.
-        This method doesn't raise since the calls to direct_func and host_func are already wrapped and handle any exceptions.
-        Possible return values are manifest, artifacts profile, True or None.
-        """
-        direct_channel = lambda: self.__send_request_using_direct_channel(direct_func)
-        host_channel = lambda: self.__send_request_using_host_channel(host_func)
+        hgap_download_function_with_retry = lambda: self._call_hostplugin_with_container_check(hgap_download)
 
         if HostPluginProtocol.is_default_channel:
-            primary_channel, secondary_channel = host_channel, direct_channel
+            primary_channel, secondary_channel = hgap_download_function_with_retry, direct_download
         else:
-            primary_channel, secondary_channel = direct_channel, host_channel
+            primary_channel, secondary_channel = direct_download, hgap_download_function_with_retry
 
-        ret = primary_channel()
-        if ret is not None:
-            return ret
+        try:
+            return primary_channel()
+        except Exception as exception:
+            primary_channel_error = exception
 
-        ret = secondary_channel()
-        if ret is not None:
+        try:
+            return_value = secondary_channel()
+
+            # Since the secondary channel succeeded, flip the default channel
             HostPluginProtocol.is_default_channel = not HostPluginProtocol.is_default_channel
-            message = "Default channel changed to {0} channel.".format("HostGA" if HostPluginProtocol.is_default_channel else "direct")
+            message = "Default channel changed to {0} channel.".format("HostGAPlugin" if HostPluginProtocol.is_default_channel else "Direct")
             logger.info(message)
             add_event(AGENT_NAME, op=WALAEventOperation.DefaultChannelChange, version=CURRENT_VERSION, is_success=True, message=message, log_event=False)
-        return ret
+
+            return return_value
+        except Exception as exception:
+            raise HttpError("Download failed both on the primary and fallback channels. Primary: [{0}] Fallback: [{1}]".format(ustr(primary_channel_error), ustr(exception)))
 
     def upload_status_blob(self):
-        extensions_goal_state = self.get_extensions_goal_state()
+        extensions_goal_state = self.get_goal_state().extensions_goal_state
 
         if extensions_goal_state.status_upload_blob is None:
             # the status upload blob is in ExtensionsConfig so force a full goal state refresh
-            self.update_goal_state(force_update=True)
-            extensions_goal_state = self.get_extensions_goal_state()
+            self.update_goal_state(force_update=True, silent=True)
+            extensions_goal_state = self.get_goal_state().extensions_goal_state
 
-        if extensions_goal_state.status_upload_blob is None:
-            raise ProtocolNotFoundError("Status upload uri is missing")
+            if extensions_goal_state.status_upload_blob is None:
+                raise ProtocolNotFoundError("Status upload uri is missing")
+
+            logger.info("Refreshed the goal state to get the status upload blob. New Goal State ID: {0}", extensions_goal_state.id)
 
         blob_type = extensions_goal_state.status_upload_blob_type
 
@@ -1318,9 +1126,12 @@ class WireClient(object):
         }
 
     def get_header_for_cert(self):
-        trans_cert_file = os.path.join(conf.get_lib_dir(),
-                                       TRANSPORT_CERT_FILE_NAME)
-        content = self.fetch_cache(trans_cert_file)
+        trans_cert_file = os.path.join(conf.get_lib_dir(), TRANSPORT_CERT_FILE_NAME)
+        try:
+            content = fileutil.read_file(trans_cert_file)
+        except IOError as e:
+            raise ProtocolError("Failed to read {0}: {1}".format(trans_cert_file, e))
+
         cert = get_bytes_from_pem(content)
         return {
             "x-ms-agent-name": "WALinuxAgent",
@@ -1331,28 +1142,14 @@ class WireClient(object):
 
     def get_host_plugin(self):
         if self._host_plugin is None:
-            goal_state = GoalState(self)
-            self._set_host_plugin(HostPluginProtocol(self.get_endpoint(), goal_state.container_id, goal_state.role_config_name))
-            try:
-                etag, vm_settings = self._fetch_vm_settings(None)
-                extensions_goal_state = ExtensionsGoalStateFactory.create_from_vm_settings(etag, vm_settings)
-                message = "HostGAPlugin version: {0}".format(extensions_goal_state.host_ga_plugin_version)
-                logger.info(message)
-                add_event(op=WALAEventOperation.HostPlugin, message=message, is_success=True)
-            except Exception as exception:
-                message = "Failed to determine the HostGAPlugin version. Error: {0}".format(textutil.format_exception(exception))
-                logger.warn(message)
-                add_event(op=WALAEventOperation.HostPlugin, message=message, is_success=False, log_event=False)
+            self._host_plugin = HostPluginProtocol(self.get_endpoint())
+            GoalState.update_host_plugin_headers(self)
         return self._host_plugin
 
     def get_on_hold(self):
-        return self.get_extensions_goal_state().on_hold
+        return self.get_goal_state().extensions_goal_state.on_hold
 
     def upload_logs(self, content):
-        host_func = lambda: self._upload_logs_through_host(content)
-        return self._call_hostplugin_with_container_check(host_func)
-
-    def _upload_logs_through_host(self, content):
         host = self.get_host_plugin()
         return host.put_vm_log(content)
 
@@ -1425,9 +1222,7 @@ class ExtensionManifest(object):
             pkg.version = version
             pkg.disallow_major_upgrade = disallow_major_upgrade
             for uri in uri_list:
-                pkg_uri = ExtHandlerVersionUri()
-                pkg_uri.uri = uri
-                pkg.uris.append(pkg_uri)
+                pkg.uris.append(uri)
 
             pkg.isinternal = isinternal
             self.pkg_list.versions.append(pkg)
@@ -1455,29 +1250,3 @@ class InVMArtifactsProfile(object):
         if 'onHold' in self.__dict__:
             return str(self.onHold).lower() == 'true'  # pylint: disable=E1101
         return False
-
-
-class _ErrorReporter(object):
-    _MaxErrors = 5  # Max number of error reported by period
-    _Period = timedelta(hours=1)  # How often to report _errors
-
-    def __init__(self, operation):
-        self._operation = operation
-        self._error_count = 0
-        self._next_period = datetime.now() + _ErrorReporter._Period
-        self._log_message_prefix = "[{0}] [Informational only, the Agent will continue normal operation]".format(self._operation)
-
-    def report_error(self, error):
-        self._error_count += 1
-        if self._error_count <= _ErrorReporter._MaxErrors:
-            logger.info("{0} {1}", self._log_message_prefix, error)
-            add_event(op=self._operation, message=error, is_success=False, log_event=False)
-
-    def report_summary(self):
-        if datetime.now() >= self._next_period:
-            self._next_period = datetime.now() + _ErrorReporter._Period
-            if self._error_count > 0:
-                message = "{0} errors in the last period".format(self._error_count)
-                logger.info("{0} {1}", self._log_message_prefix, message)
-                add_event(op=self._operation, message=message, is_success=False, log_event=False)
-                self._error_count = 0

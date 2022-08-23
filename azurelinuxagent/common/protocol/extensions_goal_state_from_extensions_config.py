@@ -19,21 +19,22 @@ import json
 
 from collections import defaultdict
 
-import azurelinuxagent.common.logger as logger
+from azurelinuxagent.common import logger
 from azurelinuxagent.common.event import add_event, WALAEventOperation
 from azurelinuxagent.common.exception import ExtensionsConfigError
 from azurelinuxagent.common.future import ustr
-from azurelinuxagent.common.protocol.extensions_goal_state import ExtensionsGoalState
-from azurelinuxagent.common.protocol.restapi import Extension, ExtHandler, ExtHandlerVersionUri, VMAgentManifest, \
-    VMAgentManifestUri, ExtensionState, ExtHandlerList, VMAgentManifestList, InVMGoalStateMetaData
+from azurelinuxagent.common.protocol.extensions_goal_state import ExtensionsGoalState, GoalStateChannel, GoalStateSource
+from azurelinuxagent.common.protocol.restapi import ExtensionSettings, Extension, VMAgentManifest, ExtensionState, InVMGoalStateMetaData
 from azurelinuxagent.common.utils.textutil import parse_doc, parse_json, findall, find, findtext, getattrib, gettext, format_exception, \
     is_str_none_or_whitespace, is_str_empty
 
 
 class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
-    def __init__(self, incarnation, xml_text, wire_client=None):
+    def __init__(self, incarnation, xml_text, wire_client):
         super(ExtensionsGoalStateFromExtensionsConfig, self).__init__()
-        self._id = incarnation
+        self._id = "incarnation_{0}".format(incarnation)
+        self._is_outdated = False
+        self._incarnation = incarnation
         self._text = xml_text
         self._status_upload_blob = None
         self._status_upload_blob_type = None
@@ -42,9 +43,8 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
         self._activity_id = None
         self._correlation_id = None
         self._created_on_timestamp = None
-
-        self.ext_handlers = ExtHandlerList()
-        self.vmagent_manifests = VMAgentManifestList()
+        self._agent_manifests = []
+        self._extensions = []
 
         try:
             self._parse_extensions_config(xml_text, wire_client)
@@ -60,14 +60,13 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
 
         for ga_family in ga_families:
             family = findtext(ga_family, "Name")
+            version = findtext(ga_family, "Version")
             uris_list = find(ga_family, "Uris")
             uris = findall(uris_list, "Uri")
-            manifest = VMAgentManifest()
-            manifest.family = family
+            manifest = VMAgentManifest(family, version)
             for uri in uris:
-                manifest_uri = VMAgentManifestUri(uri=gettext(uri))
-                manifest.versionsManifestUris.append(manifest_uri)
-            self.vmagent_manifests.vmAgentManifests.append(manifest)
+                manifest.uris.append(gettext(uri))
+            self._agent_manifests.append(manifest)
 
         self.__parse_plugins_and_settings_and_populate_ext_handlers(xml_doc)
 
@@ -81,51 +80,42 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
         self._status_upload_blob_type = getattrib(status_upload_node, "statusBlobType")
         logger.verbose("Extension config shows status blob type as [{0}]", self._status_upload_blob_type)
 
-        self._on_hold = self._fetch_extensions_on_hold(xml_doc, wire_client)
+        self._on_hold = ExtensionsGoalStateFromExtensionsConfig._fetch_extensions_on_hold(xml_doc, wire_client)
 
         in_vm_gs_metadata = InVMGoalStateMetaData(find(xml_doc, "InVMGoalStateMetaData"))
         self._activity_id = self._string_to_id(in_vm_gs_metadata.activity_id)
         self._correlation_id = self._string_to_id(in_vm_gs_metadata.correlation_id)
         self._created_on_timestamp = self._ticks_to_utc_timestamp(in_vm_gs_metadata.created_on_ticks)
 
-    def _fetch_extensions_on_hold(self, xml_doc, wire_client):
+    @staticmethod
+    def _fetch_extensions_on_hold(xml_doc, wire_client):
+        def log_info(message):
+            logger.info(message)
+            add_event(op=WALAEventOperation.ArtifactsProfileBlob, message=message, is_success=True, log_event=False)
+
+        def log_warning(message):
+            logger.warn(message)
+            add_event(op=WALAEventOperation.ArtifactsProfileBlob, message=message, is_success=False, log_event=False)
+
         artifacts_profile_blob = findtext(xml_doc, "InVMArtifactsProfileBlob")
         if is_str_none_or_whitespace(artifacts_profile_blob):
+            log_info("ExtensionsConfig does not include a InVMArtifactsProfileBlob; will assume the VM is not on hold")
             return False
 
-        def fetch_direct():
-            content, _ = wire_client.fetch(artifacts_profile_blob)
-            return content
-
-        def fetch_through_host():
-            host = wire_client.get_host_plugin()
-            uri, headers = host.get_artifact_request(artifacts_profile_blob)
-            content, _ = wire_client.fetch(uri, headers, use_proxy=False)
-            return content
-
-        logger.verbose("Retrieving the artifacts profile")
-
         try:
-            profile = wire_client.send_request_using_appropriate_channel(fetch_direct, fetch_through_host)
-            if profile is None:
-                logger.warn("Failed to fetch artifacts profile from blob {0}", artifacts_profile_blob)
-                return False
+            profile = wire_client.fetch_artifacts_profile_blob(artifacts_profile_blob)
         except Exception as error:
-            logger.warn("Exception retrieving artifacts profile from blob {0}. Error: {1}".format(artifacts_profile_blob, ustr(error)))
+            log_warning("Can't download the artifacts profile blob; will assume the VM is not on hold. {0}".format(ustr(error)))
             return False
 
         if is_str_empty(profile):
+            log_info("The artifacts profile blob is empty; will assume the VM is not on hold.")
             return False
-
-        logger.verbose("Artifacts profile downloaded")
 
         try:
             artifacts_profile = _InVMArtifactsProfile(profile)
-        except Exception:
-            logger.warn("Could not parse artifacts profile blob")
-            msg = "Content: [{0}]".format(profile)
-            logger.verbose(msg)
-            add_event(op=WALAEventOperation.ArtifactsProfileBlob, is_success=False, message=msg, log_event=False)
+        except Exception as exception:
+            log_warning("Can't parse the artifacts profile blob; will assume the VM is not on hold. Error: {0}".format(ustr(exception)))
             return False
 
         return artifacts_profile.get_on_hold()
@@ -133,6 +123,14 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
     @property
     def id(self):
         return self._id
+
+    @property
+    def incarnation(self):
+        return self._incarnation
+
+    @property
+    def svd_sequence_number(self):
+        return self._incarnation
 
     @property
     def activity_id(self):
@@ -145,6 +143,14 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
     @property
     def created_on_timestamp(self):
         return self._created_on_timestamp
+
+    @property
+    def channel(self):
+        return GoalStateChannel.WireServer
+
+    @property
+    def source(self):
+        return GoalStateSource.Fabric
 
     @property
     def status_upload_blob(self):
@@ -165,10 +171,18 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
     def on_hold(self):
         return self._on_hold
 
+    @property
+    def agent_manifests(self):
+        return self._agent_manifests
+
+    @property
+    def extensions(self):
+        return self._extensions
+
     def get_redacted_text(self):
         text = self._text
-        for ext_handler in self.ext_handlers.extHandlers:
-            for extension in ext_handler.properties.extensions:
+        for ext_handler in self._extensions:
+            for extension in ext_handler.settings:
                 if extension.protectedSettings is not None:
                     text = text.replace(extension.protectedSettings, "*** REDACTED ***")
         return text
@@ -224,17 +238,17 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
         plugin_settings = findall(plugin_settings_list, "Plugin")
 
         for plugin in plugins:
-            ext_handler = ExtHandler()
+            extension = Extension()
             try:
-                ExtensionsGoalStateFromExtensionsConfig._parse_plugin(ext_handler, plugin)
-                ExtensionsGoalStateFromExtensionsConfig._parse_plugin_settings(ext_handler, plugin_settings)
+                ExtensionsGoalStateFromExtensionsConfig._parse_plugin(extension, plugin)
+                ExtensionsGoalStateFromExtensionsConfig._parse_plugin_settings(extension, plugin_settings)
             except ExtensionsConfigError as error:
-                ext_handler.invalid_setting_reason = ustr(error)
+                extension.invalid_setting_reason = ustr(error)
 
-            self.ext_handlers.extHandlers.append(ext_handler)
+            self._extensions.append(extension)
 
     @staticmethod
-    def _parse_plugin(ext_handler, plugin):
+    def _parse_plugin(extension, plugin):
         """
         Sample config:
 
@@ -266,11 +280,11 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
                           log_event=True, is_success=False)
             return value
 
-        ext_handler.name = _log_error_if_none("Extensions.Plugins.Plugin.name", getattrib(plugin, "name"))
-        ext_handler.properties.version = _log_error_if_none("Extensions.Plugins.Plugin.version",
+        extension.name = _log_error_if_none("Extensions.Plugins.Plugin.name", getattrib(plugin, "name"))
+        extension.version = _log_error_if_none("Extensions.Plugins.Plugin.version",
                                                             getattrib(plugin, "version"))
-        ext_handler.properties.state = getattrib(plugin, "state")
-        if ext_handler.properties.state in (None, ""):
+        extension.state = getattrib(plugin, "state")
+        if extension.state in (None, ""):
             raise ExtensionsConfigError("Received empty Extensions.Plugins.Plugin.state, failing Handler")
 
         def getattrib_wrapped_in_list(node, attr_name):
@@ -288,12 +302,10 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
             locations += [gettext(node) for node in nodes_list]
 
         for uri in locations:
-            version_uri = ExtHandlerVersionUri()
-            version_uri.uri = uri
-            ext_handler.versionUris.append(version_uri)
+            extension.manifest_uris.append(uri)
 
     @staticmethod
-    def _parse_plugin_settings(ext_handler, plugin_settings):
+    def _parse_plugin_settings(extension, plugin_settings):
         """
         Sample config:
 
@@ -330,26 +342,26 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
         if plugin_settings is None:
             return
 
-        handler_name = ext_handler.name
-        version = ext_handler.properties.version
+        extension_name = extension.name
+        version = extension.version
 
         def to_lower(str_to_change): return str_to_change.lower() if str_to_change is not None else None
 
-        ext_handler_plugin_settings = [x for x in plugin_settings if to_lower(getattrib(x, "name")) == to_lower(handler_name)]
-        if not ext_handler_plugin_settings:
+        extension_plugin_settings = [x for x in plugin_settings if to_lower(getattrib(x, "name")) == to_lower(extension_name)]
+        if not extension_plugin_settings:
             return
 
-        settings = [x for x in ext_handler_plugin_settings if getattrib(x, "version") == version]
-        if len(settings) != len(ext_handler_plugin_settings):
-            msg = "ExtHandler PluginSettings Version Mismatch! Expected PluginSettings version: {0} for Handler: {1} but found versions: ({2})".format(
-                version, handler_name, ', '.join(set([getattrib(x, "version") for x in ext_handler_plugin_settings])))
+        settings = [x for x in extension_plugin_settings if getattrib(x, "version") == version]
+        if len(settings) != len(extension_plugin_settings):
+            msg = "Extension PluginSettings Version Mismatch! Expected PluginSettings version: {0} for Extension: {1} but found versions: ({2})".format(
+                version, extension_name, ', '.join(set([getattrib(x, "version") for x in extension_plugin_settings])))
             add_event(op=WALAEventOperation.PluginSettingsVersionMismatch, message=msg, log_event=True,
                       is_success=False)
             raise ExtensionsConfigError(msg)
 
         if len(settings) > 1:
-            msg = "Multiple plugin settings found for the same handler: {0} and version: {1} (Expected: 1; Available: {2})".format(
-                handler_name, version, len(settings))
+            msg = "Multiple plugin settings found for the same extension: {0} and version: {1} (Expected: 1; Available: {2})".format(
+                extension_name, version, len(settings))
             raise ExtensionsConfigError(msg)
 
         plugin_settings_node = settings[0]
@@ -358,22 +370,22 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
 
         if any(runtime_settings_nodes) and any(extension_runtime_settings_nodes):
             # There can only be a single RuntimeSettings node or multiple ExtensionRuntimeSettings nodes per Plugin
-            msg = "Both RuntimeSettings and ExtensionRuntimeSettings found for the same handler: {0} and version: {1}".format(
-                handler_name, version)
+            msg = "Both RuntimeSettings and ExtensionRuntimeSettings found for the same extension: {0} and version: {1}".format(
+                extension_name, version)
             raise ExtensionsConfigError(msg)
 
         if runtime_settings_nodes:
             if len(runtime_settings_nodes) > 1:
-                msg = "Multiple RuntimeSettings found for the same handler: {0} and version: {1} (Expected: 1; Available: {2})".format(
-                    handler_name, version, len(runtime_settings_nodes))
+                msg = "Multiple RuntimeSettings found for the same extension: {0} and version: {1} (Expected: 1; Available: {2})".format(
+                    extension_name, version, len(runtime_settings_nodes))
                 raise ExtensionsConfigError(msg)
             # Only Runtime settings available, parse that
-            ExtensionsGoalStateFromExtensionsConfig.__parse_runtime_settings(plugin_settings_node, runtime_settings_nodes[0], handler_name,
-                                                      ext_handler)
+            ExtensionsGoalStateFromExtensionsConfig.__parse_runtime_settings(plugin_settings_node, runtime_settings_nodes[0], extension_name,
+                                                                             extension)
         elif extension_runtime_settings_nodes:
             # Parse the ExtensionRuntime settings for the given extension
             ExtensionsGoalStateFromExtensionsConfig.__parse_extension_runtime_settings(plugin_settings_node, extension_runtime_settings_nodes,
-                                                                ext_handler)
+                                                                extension)
 
     @staticmethod
     def __get_dependency_level_from_node(depends_on_node, name):
@@ -387,7 +399,7 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
         return depends_on_level
 
     @staticmethod
-    def __parse_runtime_settings(plugin_settings_node, runtime_settings_node, handler_name, ext_handler):
+    def __parse_runtime_settings(plugin_settings_node, runtime_settings_node, extension_name, extension):
         """
         Sample Plugin in PluginSettings containing DependsOn and RuntimeSettings (single settings per extension) -
 
@@ -416,12 +428,12 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
                 len(depends_on_nodes))
             raise ExtensionsConfigError(msg)
         depends_on_node = depends_on_nodes[0] if depends_on_nodes else None
-        depends_on_level = ExtensionsGoalStateFromExtensionsConfig.__get_dependency_level_from_node(depends_on_node, handler_name)
-        ExtensionsGoalStateFromExtensionsConfig.__parse_and_add_extension_settings(runtime_settings_node, handler_name, ext_handler,
-                                                            depends_on_level)
+        depends_on_level = ExtensionsGoalStateFromExtensionsConfig.__get_dependency_level_from_node(depends_on_node, extension_name)
+        ExtensionsGoalStateFromExtensionsConfig.__parse_and_add_extension_settings(runtime_settings_node, extension_name, extension,
+                                                                                   depends_on_level)
 
     @staticmethod
-    def __parse_extension_runtime_settings(plugin_settings_node, extension_runtime_settings_nodes, ext_handler):
+    def __parse_extension_runtime_settings(plugin_settings_node, extension_runtime_settings_nodes, extension):
         """
         Sample PluginSettings containing DependsOn and ExtensionRuntimeSettings -
 
@@ -482,7 +494,7 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
             dependency_level = ExtensionsGoalStateFromExtensionsConfig.__get_dependency_level_from_node(depends_on_node, extension_name)
             dependency_levels[extension_name] = dependency_level
 
-        ext_handler.supports_multi_config = True
+        extension.supports_multi_config = True
         for extension_runtime_setting_node in extension_runtime_settings_nodes:
             # Name and State will only be set for ExtensionRuntimeSettings for Multi-Config
             extension_name = getattrib(extension_runtime_setting_node, "name")
@@ -492,11 +504,11 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
             state = getattrib(extension_runtime_setting_node, "state")
             state = ustr(state.lower()) if state not in (None, "") else ExtensionState.Enabled
             ExtensionsGoalStateFromExtensionsConfig.__parse_and_add_extension_settings(extension_runtime_setting_node, extension_name,
-                                                                ext_handler, dependency_levels[extension_name],
+                                                                extension, dependency_levels[extension_name],
                                                                 state=state)
 
     @staticmethod
-    def __parse_and_add_extension_settings(settings_node, name, ext_handler, depends_on_level, state=ExtensionState.Enabled):
+    def __parse_and_add_extension_settings(settings_node, name, extension, depends_on_level, state=ExtensionState.Enabled):
         seq_no = getattrib(settings_node, "seqNo")
         if seq_no in (None, ""):
             raise ExtensionsConfigError("SeqNo not specified for the Extension: {0}".format(name))
@@ -508,23 +520,23 @@ class ExtensionsGoalStateFromExtensionsConfig(ExtensionsGoalState):
             # Incase of invalid/no settings, add the name and seqNo of the Extension and treat it as an extension with
             # no settings since we were able to successfully parse those data properly. Without this, we wont report
             # anything for that sequence number and CRP would eventually have to timeout rather than fail fast.
-            ext_handler.properties.extensions.append(
-                Extension(name=name, sequenceNumber=seq_no, state=state, dependencyLevel=depends_on_level))
+            extension.settings.append(
+                ExtensionSettings(name=name, sequenceNumber=seq_no, state=state, dependencyLevel=depends_on_level))
             return
 
         for plugin_settings_list in runtime_settings["runtimeSettings"]:
             handler_settings = plugin_settings_list["handlerSettings"]
-            ext = Extension()
+            extension_settings = ExtensionSettings()
             # There is no "extension name" for single Handler Settings. Use HandlerName for those
-            ext.name = name
-            ext.state = state
-            ext.sequenceNumber = seq_no
-            ext.publicSettings = handler_settings.get("publicSettings")
-            ext.protectedSettings = handler_settings.get("protectedSettings")
-            ext.dependencyLevel = depends_on_level
+            extension_settings.name = name
+            extension_settings.state = state
+            extension_settings.sequenceNumber = int(seq_no)
+            extension_settings.publicSettings = handler_settings.get("publicSettings")
+            extension_settings.protectedSettings = handler_settings.get("protectedSettings")
+            extension_settings.dependencyLevel = depends_on_level
             thumbprint = handler_settings.get("protectedSettingsCertThumbprint")
-            ext.certificateThumbprint = thumbprint
-            ext_handler.properties.extensions.append(ext)
+            extension_settings.certificateThumbprint = thumbprint
+            extension.settings.append(extension_settings)
 
 
 # Do not extend this class
